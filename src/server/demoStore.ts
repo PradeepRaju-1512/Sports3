@@ -4,6 +4,7 @@ import type {
   AuctionRound,
   BidEvent,
   FranchiseSummary,
+  LiveAuctionDelta,
   LiveAuctionSnapshot,
 } from "../types/auction.js";
 
@@ -15,6 +16,7 @@ export interface DemoUserRecord {
   batch: string;
   branch: string;
   role: string;
+  passwordHash?: string | null;
   createdAt: Date;
 }
 
@@ -55,6 +57,7 @@ export interface ActivityRecord {
   targetBatch: string;
   categoryGender: string;
   scheduledLabel: string;
+  scheduledAt: string | null;
   venue: string;
   createdByUserId: number | null;
   createdAt: Date;
@@ -88,6 +91,7 @@ export interface TournamentTeamRecord {
   tournamentId: number;
   sportName: string;
   teamName: string;
+  captainUserId: number | null;
   placement: string | null;
   played: number;
   won: number;
@@ -100,10 +104,32 @@ export interface TournamentTeamRecord {
 export interface RosterMemberRecord {
   id: number;
   teamId: number;
+  userId: number | null;
   playerName: string;
   playerRole: string;
   batchYear: string;
   branch: string;
+}
+
+export interface TeamSubmissionPlayer {
+  userId?: number | null;
+  name: string;
+  role: string;
+  jersey?: string;
+}
+
+export interface TeamSubmissionRecord {
+  id: number;
+  tournamentId: number;
+  teamId: number | null;
+  sportName: string;
+  teamName: string;
+  captainUserId: number;
+  status: "DRAFT" | "SUBMITTED" | "APPROVED" | "LOCKED" | "CHANGES_REQUESTED";
+  players: TeamSubmissionPlayer[];
+  reviewerNotes: string;
+  updatedAt: string;
+  createdAt: string;
 }
 
 export interface MatchRecord {
@@ -118,13 +144,33 @@ export interface MatchRecord {
   scoreB: string;
   status: string;
   scheduledTime: string;
+  scheduledAt: string | null;
   venue: string;
   resultSummary: string;
   detailedBreakdown: string;
+  scoringEventsJson?: string | null;
+  scoringStateJson?: string | null;
+  lineupAJson?: string | null;
+  lineupBJson?: string | null;
   scorerUserId: number | null;
 }
 
+export interface PlayerPhotoRecord {
+  publicKey: string;
+  uploadedByUserId: number | null;
+  mimeType: string;
+  dataBase64: string;
+  sizeBytes: number;
+  createdAt: string;
+}
+
 const now = new Date();
+const today5pm = new Date();
+today5pm.setHours(17, 0, 0, 0);
+const tomorrow430pm = new Date(Date.now() + 24 * 60 * 60 * 1000);
+tomorrow430pm.setHours(16, 30, 0, 0);
+const tomorrow5pm = new Date(Date.now() + 24 * 60 * 60 * 1000);
+tomorrow5pm.setHours(17, 0, 0, 0);
 
 export const demoStore = {
   users: [
@@ -216,6 +262,16 @@ export const demoStore = {
       batch: "1ST",
       branch: "ECE",
       role: "STUDENT",
+      createdAt: now,
+    },
+    {
+      id: 10,
+      name: "Devansh Kulkarni",
+      email: "devansh.23@iiitt.ac.in",
+      rollNumber: "CS23B1048",
+      batch: "3RD",
+      branch: "CSE",
+      role: "CAPTAIN",
       createdAt: now,
     },
   ] as DemoUserRecord[],
@@ -421,6 +477,7 @@ export const demoStore = {
       tournamentId: 1,
       sportName: "Cricket",
       teamName: "Trichy Titans",
+      captainUserId: 10,
       placement: "NONE",
       played: 2,
       won: 2,
@@ -434,6 +491,7 @@ export const demoStore = {
       tournamentId: 1,
       sportName: "Cricket",
       teamName: "Cauvery Kings",
+      captainUserId: 1,
       placement: "NONE",
       played: 2,
       won: 1,
@@ -447,6 +505,7 @@ export const demoStore = {
       tournamentId: 1,
       sportName: "Cricket",
       teamName: "Delta Dynamos",
+      captainUserId: 4,
       placement: "NONE",
       played: 2,
       won: 0,
@@ -460,6 +519,7 @@ export const demoStore = {
       tournamentId: 1,
       sportName: "Football",
       teamName: "Kaveri United",
+      captainUserId: 10,
       placement: "NONE",
       played: 1,
       won: 1,
@@ -473,6 +533,7 @@ export const demoStore = {
       tournamentId: 1,
       sportName: "Football",
       teamName: "Chola Rovers",
+      captainUserId: 8,
       placement: "NONE",
       played: 1,
       won: 0,
@@ -486,6 +547,7 @@ export const demoStore = {
       tournamentId: 3,
       sportName: "Cricket",
       teamName: "Trichy Titans",
+      captainUserId: 1,
       placement: "WINNER",
       played: 4,
       won: 4,
@@ -499,6 +561,7 @@ export const demoStore = {
       tournamentId: 3,
       sportName: "Cricket",
       teamName: "Cauvery Kings",
+      captainUserId: 4,
       placement: "RUNNER_UP_1",
       played: 4,
       won: 2,
@@ -512,6 +575,7 @@ export const demoStore = {
       tournamentId: 3,
       sportName: "Cricket",
       teamName: "Pallava Strikers",
+      captainUserId: 8,
       placement: "RUNNER_UP_2",
       played: 4,
       won: 1,
@@ -525,6 +589,7 @@ export const demoStore = {
       tournamentId: 4,
       sportName: "Football",
       teamName: "Chola Rovers",
+      captainUserId: 8,
       placement: "WINNER",
       played: 3,
       won: 3,
@@ -538,6 +603,7 @@ export const demoStore = {
       tournamentId: 4,
       sportName: "Football",
       teamName: "Kaveri United",
+      captainUserId: 1,
       placement: "RUNNER_UP_1",
       played: 3,
       won: 2,
@@ -551,6 +617,7 @@ export const demoStore = {
       tournamentId: 4,
       sportName: "Football",
       teamName: "Rockfort XI",
+      captainUserId: 3,
       placement: "RUNNER_UP_2",
       played: 3,
       won: 1,
@@ -562,63 +629,65 @@ export const demoStore = {
   ] as TournamentTeamRecord[],
 
   rosterMembers: [
+    // Current tournament rosters (linked to real userIds)
+    { id: 101, teamId: 1, userId: 10, playerName: "Devansh Kulkarni", playerRole: "Captain / Batter", batchYear: "3RD", branch: "CSE" },
+    { id: 102, teamId: 1, userId: 4, playerName: "Rohan Verma", playerRole: "All-Rounder", batchYear: "2ND", branch: "CSE" },
+    { id: 103, teamId: 1, userId: 7, playerName: "Meera Krishnan", playerRole: "Bowler", batchYear: "1ST", branch: "MECH" },
+    { id: 104, teamId: 2, userId: 1, playerName: "Karthik Nair", playerRole: "Captain / Bowler", batchYear: "4TH", branch: "CSE" },
+    { id: 105, teamId: 2, userId: 3, playerName: "Aditi Menon", playerRole: "Wicketkeeper", batchYear: "3RD", branch: "ECE" },
+    { id: 106, teamId: 2, userId: 9, playerName: "Ananya Reddy", playerRole: "Batter", batchYear: "1ST", branch: "ECE" },
+    { id: 107, teamId: 3, userId: 6, playerName: "Vikram Rao", playerRole: "Captain / All-Rounder", batchYear: "4TH", branch: "ECE" },
+    { id: 108, teamId: 3, userId: 5, playerName: "Arjun Das", playerRole: "Bowler", batchYear: "3RD", branch: "CSE" },
+    { id: 109, teamId: 4, userId: 10, playerName: "Devansh Kulkarni", playerRole: "Captain / Midfielder", batchYear: "3RD", branch: "CSE" },
+    { id: 110, teamId: 4, userId: 8, playerName: "Siddharth Iyer", playerRole: "Striker", batchYear: "MTECH", branch: "CSE" },
+    { id: 111, teamId: 5, userId: 6, playerName: "Vikram Rao", playerRole: "Defender", batchYear: "4TH", branch: "ECE" },
+    // Archive rosters
+    { id: 1, teamId: 6, userId: 1, playerName: "Karthik Nair", playerRole: "Captain / All-Rounder", batchYear: "3RD", branch: "CSE" },
+    { id: 2, teamId: 6, userId: 3, playerName: "Aditi Menon", playerRole: "Top-Order Batter", batchYear: "2ND", branch: "ECE" },
+    { id: 3, teamId: 7, userId: 4, playerName: "Rohan Verma", playerRole: "Captain / Pace Bowler", batchYear: "1ST", branch: "CSE" },
+    { id: 4, teamId: 8, userId: 8, playerName: "Siddharth Iyer", playerRole: "Wicketkeeper / Batter", batchYear: "MTECH", branch: "CSE" },
+    { id: 5, teamId: 9, userId: 8, playerName: "Siddharth Iyer", playerRole: "Captain / Striker", batchYear: "MTECH", branch: "CSE" },
+    { id: 6, teamId: 10, userId: 1, playerName: "Karthik Nair", playerRole: "Midfielder", batchYear: "2ND", branch: "CSE" },
+    { id: 7, teamId: 11, userId: 3, playerName: "Aditi Menon", playerRole: "Defender", batchYear: "1ST", branch: "ECE" },
+  ] as RosterMemberRecord[],
+
+  teamSubmissions: [
     {
       id: 1,
-      teamId: 6,
-      playerName: "Karthik Nair",
-      playerRole: "Captain / All-Rounder",
-      batchYear: "3RD",
-      branch: "CSE",
+      tournamentId: 1,
+      teamId: 1,
+      sportName: "Cricket",
+      teamName: "Trichy Titans",
+      captainUserId: 10,
+      status: "APPROVED",
+      players: [
+        { userId: 10, name: "Devansh Kulkarni", role: "Captain / Batter", jersey: "7" },
+        { userId: 4, name: "Rohan Verma", role: "All-Rounder", jersey: "18" },
+        { userId: 7, name: "Meera Krishnan", role: "Bowler", jersey: "24" },
+      ],
+      reviewerNotes: "Verified eligible squad for Odd Semester Championship.",
+      updatedAt: now.toISOString(),
+      createdAt: now.toISOString(),
     },
     {
       id: 2,
-      teamId: 6,
-      playerName: "Aditi Menon",
-      playerRole: "Top-Order Batter",
-      batchYear: "2ND",
-      branch: "ECE",
+      tournamentId: 1,
+      teamId: 4,
+      sportName: "Football",
+      teamName: "Kaveri United",
+      captainUserId: 10,
+      status: "SUBMITTED",
+      players: [
+        { userId: 10, name: "Devansh Kulkarni", role: "Captain / Midfielder", jersey: "10" },
+        { userId: 8, name: "Siddharth Iyer", role: "Striker", jersey: "9" },
+      ],
+      reviewerNotes: "",
+      updatedAt: now.toISOString(),
+      createdAt: now.toISOString(),
     },
-    {
-      id: 3,
-      teamId: 7,
-      playerName: "Rohan Verma",
-      playerRole: "Captain / Pace Bowler",
-      batchYear: "1ST",
-      branch: "CSE",
-    },
-    {
-      id: 4,
-      teamId: 8,
-      playerName: "Siddharth Iyer",
-      playerRole: "Wicketkeeper / Batter",
-      batchYear: "MTECH",
-      branch: "CSE",
-    },
-    {
-      id: 5,
-      teamId: 9,
-      playerName: "Siddharth Iyer",
-      playerRole: "Captain / Striker",
-      batchYear: "MTECH",
-      branch: "CSE",
-    },
-    {
-      id: 6,
-      teamId: 10,
-      playerName: "Karthik Nair",
-      playerRole: "Midfielder",
-      batchYear: "2ND",
-      branch: "CSE",
-    },
-    {
-      id: 7,
-      teamId: 11,
-      playerName: "Aditi Menon",
-      playerRole: "Defender",
-      batchYear: "1ST",
-      branch: "ECE",
-    },
-  ] as RosterMemberRecord[],
+  ] as TeamSubmissionRecord[],
+
+  playerPhotos: new Map<string, PlayerPhotoRecord>(),
 
   matches: [
     {
@@ -632,11 +701,16 @@ export const demoStore = {
       scoreA: "94/3 (11.2 ov)",
       scoreB: "Yet to bat",
       status: "LIVE",
-      scheduledTime: "Today · Live Now",
+      scheduledTime: now.toISOString(),
+      scheduledAt: now.toISOString(),
       venue: "IIITT Cricket Ground",
       resultSummary: "In Progress — Powerplay & middle overs underway",
       detailedBreakdown:
         "Top Performers: R. Verma 41*(26), K. Nair 2/18.\nVenue: IIITT Cricket Ground.",
+      scoringEventsJson: null,
+      scoringStateJson: null,
+      lineupAJson: null,
+      lineupBJson: null,
       scorerUserId: 5,
     },
     {
@@ -650,10 +724,15 @@ export const demoStore = {
       scoreA: "0",
       scoreB: "0",
       status: "UPCOMING",
-      scheduledTime: "Tomorrow, 5:00 PM",
+      scheduledTime: tomorrow5pm.toISOString(),
+      scheduledAt: tomorrow5pm.toISOString(),
       venue: "IIITT Cricket Ground",
       resultSummary: "Scheduled",
       detailedBreakdown: "15-over floodlight semi-final fixture.",
+      scoringEventsJson: null,
+      scoringStateJson: null,
+      lineupAJson: null,
+      lineupBJson: null,
       scorerUserId: 5,
     },
     {
@@ -667,11 +746,16 @@ export const demoStore = {
       scoreA: "148/5 (15 ov)",
       scoreB: "112/8 (15 ov)",
       status: "COMPLETED",
-      scheduledTime: "22 Nov 2026",
+      scheduledTime: "2026-11-22T11:30:00.000Z",
+      scheduledAt: "2026-11-22T11:30:00.000Z",
       venue: "IIITT Cricket Ground",
       resultSummary: "Trichy Titans won by 36 runs",
       detailedBreakdown:
         "Top Performers: R. Verma 58(34), A. Menon 3/14.\nOpening fixture completed.",
+      scoringEventsJson: null,
+      scoringStateJson: null,
+      lineupAJson: null,
+      lineupBJson: null,
       scorerUserId: 5,
     },
     {
@@ -685,11 +769,16 @@ export const demoStore = {
       scoreA: "3",
       scoreB: "1",
       status: "COMPLETED",
-      scheduledTime: "21 Nov 2026",
+      scheduledTime: "2026-11-21T11:30:00.000Z",
+      scheduledAt: "2026-11-21T11:30:00.000Z",
       venue: "Main Football Ground",
       resultSummary: "Kaveri United won by 2 goals",
       detailedBreakdown:
         "Top Performers: S. Iyer (2 Goals, 1 Assist).\nFull-time 70 mins.",
+      scoringEventsJson: null,
+      scoringStateJson: null,
+      lineupAJson: null,
+      lineupBJson: null,
       scorerUserId: 5,
     },
     {
@@ -703,7 +792,8 @@ export const demoStore = {
       scoreA: "162/4",
       scoreB: "145/9",
       status: "COMPLETED",
-      scheduledTime: "19 Feb 2025",
+      scheduledTime: "2025-02-19T12:00:00.000Z",
+      scheduledAt: "2025-02-19T12:00:00.000Z",
       venue: "IIITT Cricket Ground",
       resultSummary: "Trichy Titans won the Final by 17 runs",
       detailedBreakdown: "Player of the Match: Karthik Nair (64* & 2/21).",
@@ -720,7 +810,8 @@ export const demoStore = {
       scoreA: "139/6",
       scoreB: "131/10",
       status: "COMPLETED",
-      scheduledTime: "17 Feb 2025",
+      scheduledTime: "2025-02-17T12:00:00.000Z",
+      scheduledAt: "2025-02-17T12:00:00.000Z",
       venue: "IIITT Cricket Ground",
       resultSummary: "Cauvery Kings won Semi-Final by 8 runs",
       detailedBreakdown: "Player of the Match: Rohan Verma (3/19).",
@@ -737,7 +828,8 @@ export const demoStore = {
       scoreA: "154/3",
       scoreB: "109/7",
       status: "COMPLETED",
-      scheduledTime: "11 Feb 2025",
+      scheduledTime: "2025-02-11T12:00:00.000Z",
+      scheduledAt: "2025-02-11T12:00:00.000Z",
       venue: "IIITT Cricket Ground",
       resultSummary: "Trichy Titans won Opening Match by 45 runs",
       detailedBreakdown: "Player of the Match: Aditi Menon (71).",
@@ -754,7 +846,8 @@ export const demoStore = {
       scoreA: "2",
       scoreB: "1",
       status: "COMPLETED",
-      scheduledTime: "20 Oct 2024",
+      scheduledTime: "2024-10-20T12:00:00.000Z",
+      scheduledAt: "2024-10-20T12:00:00.000Z",
       venue: "Main Football Ground",
       resultSummary: "Chola Rovers won the Final 2-1",
       detailedBreakdown: "Player of the Match: Siddharth Iyer (2 Goals).",
@@ -771,7 +864,8 @@ export const demoStore = {
       scoreA: "4",
       scoreB: "0",
       status: "COMPLETED",
-      scheduledTime: "12 Oct 2024",
+      scheduledTime: "2024-10-12T12:00:00.000Z",
+      scheduledAt: "2024-10-12T12:00:00.000Z",
       venue: "Main Football Ground",
       resultSummary: "Chola Rovers won Opening Match 4-0",
       detailedBreakdown: "Player of the Match: Siddharth Iyer (Hat-trick).",
@@ -780,12 +874,13 @@ export const demoStore = {
   ] as MatchRecord[],
 };
 
-// Seed default memberships & activities for all 9 clubs in demoStore
+// Seed resource-scoped memberships & ISO-timestamped activities for all 9 clubs
 let memId = 1;
 let actId = 1;
 for (const club of demoStore.clubs) {
-  demoStore.memberships.push(
-    {
+  // Aditi Menon (3) is Secretary ONLY of Cricket & Badminton
+  if (club.slug === "cricket" || club.slug === "badminton") {
+    demoStore.memberships.push({
       id: memId++,
       clubId: club.id,
       userId: 3,
@@ -793,8 +888,11 @@ for (const club of demoStore.clubs) {
       batchScope: "ALL",
       status: "INDUCTED",
       createdAt: now,
-    },
-    {
+    });
+  }
+  // Rohan Verma (4) is 2nd-Year Coordinator ONLY of Cricket & Football
+  if (club.slug === "cricket" || club.slug === "football") {
+    demoStore.memberships.push({
       id: memId++,
       clubId: club.id,
       userId: 4,
@@ -802,7 +900,9 @@ for (const club of demoStore.clubs) {
       batchScope: "2ND",
       status: "INDUCTED",
       createdAt: now,
-    },
+    });
+  }
+  demoStore.memberships.push(
     {
       id: memId++,
       clubId: club.id,
@@ -836,36 +936,49 @@ for (const club of demoStore.clubs) {
       id: actId++,
       clubId: club.id,
       activityType: "Practice",
-      targetBatch: "4th Year",
+      targetBatch: "4TH",
       categoryGender: "Boys",
-      scheduledLabel: "Today, 5:00 PM",
+      scheduledLabel: today5pm.toISOString(),
+      scheduledAt: today5pm.toISOString(),
       venue: club.venue,
-      createdByUserId: 3,
+      createdByUserId: 1,
       createdAt: now,
     },
     {
       id: actId++,
       clubId: club.id,
       activityType: "Induction",
-      targetBatch: "All Batches",
+      targetBatch: "ALL",
       categoryGender: "Open",
-      scheduledLabel: "Tomorrow, 4:30 PM",
+      scheduledLabel: tomorrow430pm.toISOString(),
+      scheduledAt: tomorrow430pm.toISOString(),
       venue: club.venue,
-      createdByUserId: 3,
+      createdByUserId: 1,
       createdAt: now,
     }
   );
 }
 
-demoStore.notifications.push({
-  id: 1,
-  userId: 7,
-  clubId: 1,
-  message:
-    "Football: Practice · 4th Year · Boys · Today, 5:00 PM at Main Football Ground",
-  isRead: false,
-  createdAt: now,
-});
+demoStore.notifications.push(
+  {
+    id: 1,
+    userId: 7,
+    clubId: 1,
+    message:
+      "Football: Practice · 4TH · Boys at Main Football Ground",
+    isRead: false,
+    createdAt: now,
+  },
+  {
+    id: 2,
+    userId: 1,
+    clubId: 2,
+    message:
+      "Captain Devansh Kulkarni submitted Kaveri United (Football) squad for review.",
+    isRead: false,
+    createdAt: now,
+  }
+);
 
 // --- SLICE 3: AUCTION STATE & LIVE SYNC ENGINE (PER-SPORT PURSES & SQUADS) ---
 
@@ -878,6 +991,7 @@ export interface RawFranchise {
   shortCode: string;
   accentColor: string;
   captainName: string;
+  captainUserId?: number | null;
   startingPurse: number;
   minSquadSize?: number | null;
   maxSquadSize?: number | null;
@@ -903,8 +1017,9 @@ export const auctionState = {
     name: "Prothymos 2027 Mega Auction",
     seasonYear: 2027,
     sports: ["Cricket", "Football", "Volleyball", "Badminton", "Kabaddi"],
-    status: "REGISTRATION_OPEN",
-    registrationDeadline: "Feb 08, 2027 · 11:59 PM",
+    status: "LIVE",
+    registrationDeadline: "2027-02-08T18:29:00.000Z",
+    registrationDeadlineAt: "2027-02-08T18:29:00.000Z",
     clubBasePrice: 10000,
     nonClubBasePrice: 5000,
     sportBasePrices: {
@@ -923,7 +1038,8 @@ export const auctionState = {
     activeSport: "Cricket",
     currentPlayerId: 1,
     projectorMode: "STAGE",
-    lastUpdatedAt: new Date().toLocaleTimeString(),
+    version: 1,
+    lastUpdatedAt: new Date().toISOString(),
   } as AuctionConfig,
 
   rounds: [
@@ -1306,13 +1422,17 @@ export function computeFranchiseSummaries(): FranchiseSummary[] {
     const minPrice = Math.min(clubPrice, nonClubPrice);
 
     const isSameSportPlayer =
-      activePlayer &&
-      activePlayer.sport.toLowerCase() === f.sport.toLowerCase();
+      Boolean(activePlayer) &&
+      activePlayer!.sport.toLowerCase() === f.sport.toLowerCase();
 
+    // Exact non-overlapping reserve computation (zero double-counting):
+    // Count how many CLUB / NON_CLUB mandatory slots remain AFTER acquiring the active player,
+    // and only add cheapest-base flexible slots for any remaining minSquad gap beyond those quotas.
+    const nextSquadCount = squadCount + 1;
     const remClubAfterBuy = isSameSportPlayer
       ? Math.max(
           0,
-          minClub - clubCount - (activePlayer.playerClass === "CLUB" ? 1 : 0)
+          minClub - clubCount - (activePlayer!.playerClass === "CLUB" ? 1 : 0)
         )
       : Math.max(0, minClub - clubCount);
 
@@ -1321,20 +1441,21 @@ export function computeFranchiseSummaries(): FranchiseSummary[] {
           0,
           minNonClub -
             nonClubCount -
-            (activePlayer.playerClass === "NON_CLUB" ? 1 : 0)
+            (activePlayer!.playerClass === "NON_CLUB" ? 1 : 0)
         )
       : Math.max(0, minNonClub - nonClubCount);
 
-    const remainingMinSlots = Math.max(0, minSquad - squadCount - 1);
-    const remainingMaxSlotsAfterBuy = Math.max(0, maxSquad - squadCount - 1);
-    const extraMinSlots = Math.max(
+    const remainingMinSlotsAfterBuy = Math.max(0, minSquad - nextSquadCount);
+    const remainingMaxSlotsAfterBuy = Math.max(0, maxSquad - nextSquadCount);
+    const mandatoryQuotaSlots = remClubAfterBuy + remNonClubAfterBuy;
+    const extraFlexibleSlots = Math.max(
       0,
-      remainingMinSlots - remClubAfterBuy - remNonClubAfterBuy
+      remainingMinSlotsAfterBuy - mandatoryQuotaSlots
     );
     const reserveNeeded =
       remClubAfterBuy * clubPrice +
       remNonClubAfterBuy * nonClubPrice +
-      extraMinSlots * minPrice;
+      extraFlexibleSlots * minPrice;
 
     const maxAllowedBid = Math.max(0, remainingPurse - reserveNeeded);
 
@@ -1346,13 +1467,13 @@ export function computeFranchiseSummaries(): FranchiseSummary[] {
       lockReason = "Max squad size reached";
     } else if (
       isSameSportPlayer &&
-      remClubAfterBuy + remNonClubAfterBuy > remainingMaxSlotsAfterBuy
+      mandatoryQuotaSlots > remainingMaxSlotsAfterBuy
     ) {
       isEligibleToBid = false;
       lockReason = `Quota lock: reserve slots for ${remClubAfterBuy > 0 ? "CLUB" : "NON_CLUB"}`;
     } else if (
       isSameSportPlayer &&
-      maxAllowedBid < activePlayer.basePrice
+      maxAllowedBid < activePlayer!.basePrice
     ) {
       isEligibleToBid = false;
       lockReason = "Purse reserve guardrail";
@@ -1370,6 +1491,7 @@ export function computeFranchiseSummaries(): FranchiseSummary[] {
       shortCode: f.shortCode,
       accentColor: f.accentColor,
       captainName: f.captainName,
+      captainUserId: f.captainUserId ?? null,
       startingPurse: f.startingPurse,
       totalPurse: f.startingPurse,
       spentPurse,
@@ -1386,6 +1508,7 @@ export function computeFranchiseSummaries(): FranchiseSummary[] {
       lockReason,
       purchasedPlayers: owned.map((p) => ({
         id: p.id,
+        userId: p.userId,
         playerName: p.playerName,
         sport: p.sport,
         positions: p.positions,
@@ -1399,6 +1522,7 @@ export function computeFranchiseSummaries(): FranchiseSummary[] {
 
 export function buildLiveAuctionSnapshot(): LiveAuctionSnapshot {
   return {
+    version: auctionState.auction.version || 1,
     auction: auctionState.auction,
     rounds: [...auctionState.rounds].sort(
       (a, b) => a.roundNumber - b.roundNumber || a.id - b.id
@@ -1406,6 +1530,38 @@ export function buildLiveAuctionSnapshot(): LiveAuctionSnapshot {
     registrations: auctionState.registrations,
     franchises: computeFranchiseSummaries(),
     bidHistory: auctionState.bidHistory,
+    serverTime: new Date().toISOString(),
+  };
+}
+
+export function buildLiveAuctionDelta(opts?: {
+  updatedRegistration?: AuctionRegistration | null;
+  removedRegistrationId?: number | null;
+  latestBidEvent?: BidEvent | null;
+  includeRounds?: boolean;
+}): LiveAuctionDelta {
+  return {
+    type: "AUCTION_DELTA",
+    version: auctionState.auction.version || 1,
+    auction: auctionState.auction,
+    ...(opts?.includeRounds
+      ? {
+          rounds: [...auctionState.rounds].sort(
+            (a, b) => a.roundNumber - b.roundNumber || a.id - b.id
+          ),
+        }
+      : {}),
+    ...(opts?.updatedRegistration !== undefined
+      ? { updatedRegistration: opts.updatedRegistration }
+      : {}),
+    ...(opts?.removedRegistrationId !== undefined
+      ? { removedRegistrationId: opts.removedRegistrationId }
+      : {}),
+    franchises: computeFranchiseSummaries(),
+    ...(opts?.latestBidEvent !== undefined
+      ? { latestBidEvent: opts.latestBidEvent }
+      : {}),
+    bidHistoryTail: auctionState.bidHistory.slice(0, 20),
     serverTime: new Date().toISOString(),
   };
 }

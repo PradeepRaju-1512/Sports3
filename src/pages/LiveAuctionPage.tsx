@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import type { DemoUser } from "../App";
 import { useAuctionSync } from "../hooks/useAuctionSync";
+import { apiFetch, formatLocalTime, makeIdempotencyKey } from "../lib/api";
 import type { AuctionRegistration, FranchiseSummary } from "../types/auction";
 
 interface OutcomeOverlayState {
@@ -66,7 +68,8 @@ export default function LiveAuctionPage({
   projectorModeRoute?: boolean;
   onNavigate: (route: string) => void;
 }) {
-  const { snapshot, connected, error, refreshSnapshot } = useAuctionSync(1800);
+  const { snapshot, connected, error, refresh, applySnapshot } =
+    useAuctionSync();
   const [fullScreenProjector, setFullScreenProjector] =
     useState(projectorModeRoute);
   const [showOperatorControlsInProjector, setShowOperatorControlsInProjector] =
@@ -85,6 +88,7 @@ export default function LiveAuctionPage({
   const [overridePurseValue, setOverridePurseValue] = useState("");
 
   const [feedback, setFeedback] = useState("");
+  const [commandBusy, setCommandBusy] = useState(false);
   const [portraitFailed, setPortraitFailed] = useState(false);
   const [activeOverlay, setActiveOverlay] =
     useState<OutcomeOverlayState | null>(null);
@@ -185,15 +189,14 @@ export default function LiveAuctionPage({
     return Math.max(...playerBids.map((b) => b.amount));
   }, [activePlayer, auction, bidHistory]);
 
+  // bidHistory is ordered newest-first from the server
   const leadingFranchise: FranchiseSummary | null = useMemo(() => {
     if (!activePlayer) return null;
-    const lastBid = [...bidHistory]
-      .reverse()
-      .find(
-        (b) =>
-          b.playerId === activePlayer.id &&
-          (b.kind === "BID" || b.kind === "JUMP_BID")
-      );
+    const lastBid = bidHistory.find(
+      (b) =>
+        b.playerId === activePlayer.id &&
+        (b.kind === "BID" || b.kind === "JUMP_BID")
+    );
     if (!lastBid) return null;
     return (
       activeSportFranchises.find((f) => f.id === lastBid.franchiseId) || null
@@ -215,9 +218,9 @@ export default function LiveAuctionPage({
   // Detect new SOLD / UNSOLD events across synced devices and trigger broadcast stamp overlay
   useEffect(() => {
     if (!snapshot) return;
-    const latestOutcome = [...bidHistory]
-      .reverse()
-      .find((ev) => ev.kind === "SOLD" || ev.kind === "UNSOLD");
+    const latestOutcome = bidHistory.find(
+      (ev) => ev.kind === "SOLD" || ev.kind === "UNSOLD"
+    );
 
     if (!initializedHistoryRef.current) {
       initializedHistoryRef.current = true;
@@ -262,20 +265,44 @@ export default function LiveAuctionPage({
       fallbackMessage = "Updated"
     ) => {
       if (!currentUser || !canOperate) return;
-      const res = await fetch(endpoint, {
-        method,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ actorUserId: currentUser.id, ...payload }),
-      });
-      const json = await res.json();
-      if (!res.ok) {
-        setFeedback(json.error || "Operator command rejected");
-        return;
+      setCommandBusy(true);
+      try {
+        const res = await apiFetch(endpoint, {
+          method,
+          headers: {
+            "X-Idempotency-Key": makeIdempotencyKey("auc"),
+          },
+          body: JSON.stringify({
+            ...payload,
+            expectedVersion: auction?.version,
+          }),
+        });
+        const json = await res.json().catch(() => ({}));
+        if (res.status === 409) {
+          setFeedback(
+            json.error ||
+              "Auction state changed on another console. Syncing latest state..."
+          );
+          await refresh();
+          return;
+        }
+        if (!res.ok) {
+          setFeedback(json.error || "Operator command rejected");
+          return;
+        }
+        setFeedback(json.message || fallbackMessage);
+        if (json && json.auction && Array.isArray(json.franchises)) {
+          applySnapshot(json);
+        } else {
+          await refresh();
+        }
+      } catch {
+        setFeedback("Network error communicating with auction server.");
+      } finally {
+        setCommandBusy(false);
       }
-      setFeedback(json.message || fallbackMessage);
-      await refreshSnapshot();
     },
-    [currentUser, canOperate, refreshSnapshot]
+    [currentUser, canOperate, auction?.version, refresh, applySnapshot]
   );
 
   const handleFranchiseBid = useCallback(
@@ -295,19 +322,23 @@ export default function LiveAuctionPage({
         );
         return;
       }
-      await sendCommand("/api/auction/bid", {
-        playerId: activePlayer.id,
-        franchiseId: franchise.id,
-        amount: nextStandardBid,
-        kind: "BID",
-      });
+      await sendCommand(
+        "/api/auction/bid",
+        {
+          franchiseId: franchise.id,
+          customAmount: nextStandardBid,
+          isJump: false,
+        },
+        "POST",
+        `Bid ₹${nextStandardBid.toLocaleString()} by ${franchise.name}`
+      );
     },
     [activePlayer, auction, nextStandardBid, sendCommand]
   );
 
   const handleNextPlayer = useCallback(async () => {
     setActiveOverlay(null);
-    await sendCommand("/api/auction/next-player", {
+    await sendCommand("/api/auction/next", {
       sport: auction?.activeSport,
       roundId: auction?.activeRoundId,
     });
@@ -318,25 +349,27 @@ export default function LiveAuctionPage({
       setFeedback("Need a leading franchise bid before marking SOLD.");
       return;
     }
-    await sendCommand("/api/auction/outcome", {
-      playerId: activePlayer.id,
-      outcome: "SOLD",
-      franchiseId: leadingFranchise.id,
-      amount: currentHighestBid,
-    });
-  }, [activePlayer, leadingFranchise, currentHighestBid, sendCommand]);
+    await sendCommand(
+      "/api/auction/outcome",
+      { outcome: "SOLD" },
+      "POST",
+      `${activePlayer.playerName} SOLD to ${leadingFranchise.name}`
+    );
+  }, [activePlayer, leadingFranchise, sendCommand]);
 
   const handleMarkUnsold = useCallback(async () => {
     if (!activePlayer) return;
-    await sendCommand("/api/auction/outcome", {
-      playerId: activePlayer.id,
-      outcome: "UNSOLD",
-    });
+    await sendCommand(
+      "/api/auction/outcome",
+      { outcome: "UNSOLD" },
+      "POST",
+      `${activePlayer.playerName} marked UNSOLD`
+    );
   }, [activePlayer, sendCommand]);
 
   const handleUndo = useCallback(async () => {
     setActiveOverlay(null);
-    await sendCommand("/api/auction/undo");
+    await sendCommand("/api/auction/undo", {}, "POST", "Undid last auction event");
   }, [sendCommand]);
 
   const handleTriggerRtm = useCallback(async () => {
@@ -528,8 +561,8 @@ export default function LiveAuctionPage({
           <span className="muted tabular-nums">
             {auction.activeSport} · {activeRoundName} · Inc ₹
             {auction.defaultIncrement.toLocaleString()} ·{" "}
-            {connected ? "Live Sync" : "Polling"} · Updated{" "}
-            {auction.lastUpdatedAt}
+            {connected ? "Live Sync" : "Reconnecting"} · Updated{" "}
+            {formatLocalTime(auction.lastUpdatedAt)}
           </span>
         </div>
 
@@ -682,7 +715,15 @@ export default function LiveAuctionPage({
                   {activePlayer.rollNumber} · {activePlayer.sport} ·{" "}
                   {activePlayer.status.replace("_", " ")}
                 </div>
-                <h1 className="player-stage-name">{activePlayer.playerName}</h1>
+                <h1 className="player-stage-name">
+                  <Link
+                    to={`/players/${activePlayer.userId}`}
+                    className="player-link"
+                    style={{ color: "inherit" }}
+                  >
+                    {activePlayer.playerName}
+                  </Link>
+                </h1>
                 <div className="player-bio-line">
                   <span>{activePlayer.yearLabel}</span>
                   <span aria-hidden="true">·</span>
@@ -804,6 +845,7 @@ export default function LiveAuctionPage({
                 {activeSportFranchises.map((f) => {
                   const isLead = leadingFranchise?.id === f.id;
                   const disabled =
+                    commandBusy ||
                     !activePlayer ||
                     activePlayer.status === "SOLD" ||
                     activePlayer.status === "UNSOLD" ||
@@ -846,6 +888,7 @@ export default function LiveAuctionPage({
                 <button
                   type="button"
                   className="operator-btn-sold"
+                  disabled={commandBusy}
                   onClick={handleMarkSold}
                 >
                   SOLD [S]
@@ -853,6 +896,7 @@ export default function LiveAuctionPage({
                 <button
                   type="button"
                   className="operator-btn-secondary"
+                  disabled={commandBusy}
                   onClick={handleMarkUnsold}
                 >
                   UNSOLD [X]
@@ -860,6 +904,7 @@ export default function LiveAuctionPage({
                 <button
                   type="button"
                   className="operator-btn-secondary"
+                  disabled={commandBusy}
                   onClick={handleUndo}
                 >
                   Undo [U]
@@ -867,6 +912,7 @@ export default function LiveAuctionPage({
                 <button
                   type="button"
                   className="operator-btn-secondary"
+                  disabled={commandBusy}
                   onClick={handleTriggerRtm}
                 >
                   RTM [R]
@@ -875,6 +921,7 @@ export default function LiveAuctionPage({
                   type="button"
                   className="action-btn"
                   style={{ padding: "8px 12px", fontSize: 12 }}
+                  disabled={commandBusy}
                   onClick={handleNextPlayer}
                 >
                   Next [N]
@@ -908,13 +955,13 @@ export default function LiveAuctionPage({
                   <button
                     type="button"
                     className="operator-btn-secondary"
+                    disabled={commandBusy || !jumpFranchiseId || !jumpBidAmount}
                     onClick={() => {
                       if (!jumpFranchiseId || !jumpBidAmount) return;
                       sendCommand("/api/auction/bid", {
-                        playerId: activePlayer.id,
                         franchiseId: jumpFranchiseId,
-                        amount: Number(jumpBidAmount),
-                        kind: "JUMP_BID",
+                        customAmount: Number(jumpBidAmount),
+                        isJump: true,
                       });
                       setJumpBidAmount("");
                     }}
@@ -1161,9 +1208,19 @@ export default function LiveAuctionPage({
                         }
                       >
                         <div style={{ minWidth: 0 }}>
-                          <strong style={{ color: "#f4efe6", display: "block" }}>
-                            {pl.playerName}
-                          </strong>
+                          {pl.userId ? (
+                            <Link
+                              to={`/players/${pl.userId}`}
+                              className="player-link"
+                              style={{ display: "block" }}
+                            >
+                              {pl.playerName}
+                            </Link>
+                          ) : (
+                            <strong style={{ color: "#f4efe6", display: "block" }}>
+                              {pl.playerName}
+                            </strong>
+                          )}
                           <span className="muted" style={{ fontSize: 12 }}>
                             {pl.positions.join(", ")} · {pl.playerClass}
                           </span>

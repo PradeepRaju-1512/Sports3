@@ -37,6 +37,7 @@ export interface AuctionConfig {
   sports: string[];
   status: AuctionStatus;
   registrationDeadline: string;
+  registrationDeadlineAt?: string | null;
   clubBasePrice: number;
   nonClubBasePrice: number;
   sportBasePrices: Record<string, SportBasePriceOverride>;
@@ -52,6 +53,7 @@ export interface AuctionConfig {
   activeSport: string;
   currentPlayerId: number | null;
   projectorMode: "STAGE" | "SOLD" | "UNSOLD" | "STANDINGS" | "PAUSED";
+  version: number;
   lastUpdatedAt: string;
 }
 
@@ -78,6 +80,7 @@ export interface AuctionRegistration {
 
 export interface PurchasedPlayer {
   id: number;
+  userId?: number;
   playerName: string;
   sport: string;
   positions: string[];
@@ -95,6 +98,7 @@ export interface FranchiseSummary {
   shortCode: string;
   accentColor: string;
   captainName: string;
+  captainUserId?: number | null;
   startingPurse: number;
   totalPurse: number;
   spentPurse: number;
@@ -126,10 +130,24 @@ export interface BidEvent {
 }
 
 export interface LiveAuctionSnapshot {
+  version: number;
   auction: AuctionConfig | null;
   rounds: AuctionRound[];
   registrations: AuctionRegistration[];
   franchises: FranchiseSummary[];
   bidHistory: BidEvent[];
+  serverTime: string;
+}
+
+export interface LiveAuctionDelta {
+  type: "AUCTION_DELTA";
+  version: number;
+  auction: AuctionConfig;
+  rounds?: AuctionRound[];
+  updatedRegistration?: AuctionRegistration | null;
+  removedRegistrationId?: number | null;
+  franchises: FranchiseSummary[];
+  latestBidEvent?: BidEvent | null;
+  bidHistoryTail?: BidEvent[];
   serverTime: string;
 }

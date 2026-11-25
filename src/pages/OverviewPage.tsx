@@ -1,7 +1,9 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import type { DemoUser } from "../App";
+import { apiFetch } from "../lib/api";
 
-interface TournamentRow {
+interface TournamentItem {
   id: number;
   name: string;
   year: number;
@@ -19,255 +21,261 @@ export default function OverviewPage({
 }: {
   currentUser: DemoUser | null;
 }) {
-  const [tournaments, setTournaments] = useState<TournamentRow[]>([]);
-  const [editingId, setEditingId] = useState<number | null>(null);
-  const [editName, setEditName] = useState("");
-  const [editDates, setEditDates] = useState("");
-  const [editNotes, setEditNotes] = useState("");
-  const [notifyEveryone, setNotifyEveryone] = useState(true);
-  const [feedback, setFeedback] = useState("");
+  const [current, setCurrent] = useState<TournamentItem[]>([]);
+  const [upcoming, setUpcoming] = useState<TournamentItem[]>([]);
+  const [archived, setArchived] = useState<TournamentItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [archivingId, setArchivingId] = useState<number | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  const [newName, setNewName] = useState("");
-  const [newYear, setNewYear] = useState("2027");
-  const [newSemester, setNewSemester] = useState("ODD");
-  const [newDates, setNewDates] = useState("");
-  const [newSports, setNewSports] = useState("Cricket,Football,Volleyball,Badminton");
-  const [newNotes, setNewNotes] = useState("");
+  const [name, setName] = useState("");
+  const [year, setYear] = useState(2027);
+  const [semester, setSemester] = useState("EVEN");
+  const [tournamentType, setTournamentType] = useState("PROTHYMOS");
+  const [competitionFormat, setCompetitionFormat] = useState("LEAGUE_KNOCKOUT");
+  const [dateRange, setDateRange] = useState("Mar 01 – Mar 10, 2027");
+  const [sportsIncluded, setSportsIncluded] = useState(
+    "Cricket,Football,Volleyball,Badminton"
+  );
+  const [structureNotes, setStructureNotes] = useState(
+    "Evening fixtures 5:00 PM – 8:30 PM."
+  );
 
-  const isAdmin =
-    currentUser &&
-    ["SPORTS_SECRETARY", "FACULTY_ADVISOR"].includes(currentUser.role);
-
-  async function loadOverview() {
-    const res = await fetch("/api/tournaments/overview");
-    if (!res.ok) return;
-    const json = await res.json();
-    setTournaments(json.tournaments || []);
-  }
-
-  useEffect(() => {
-    loadOverview();
+  const load = useCallback(async () => {
+    setErrorMsg(null);
+    try {
+      const res = await fetch("/api/tournaments/overview", { cache: "no-store" });
+      if (!res.ok) {
+        setErrorMsg("Unable to load tournaments overview.");
+        return;
+      }
+      const d = await res.json();
+      setCurrent(d.current || []);
+      setUpcoming(d.upcoming || []);
+      setArchived(d.archived || []);
+    } catch {
+      setErrorMsg("Network error loading tournaments.");
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
-  function startEdit(t: TournamentRow) {
-    setEditingId(t.id);
-    setEditName(t.name);
-    setEditDates(t.dateRange);
-    setEditNotes(t.structureNotes);
-    setNotifyEveryone(true);
-    setFeedback("");
-  }
+  useEffect(() => {
+    void load();
+  }, [load]);
 
-  async function saveEdit(id: number) {
-    if (!currentUser) return;
-    const res = await fetch(`/api/tournaments/${id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        actorUserId: currentUser.id,
-        name: editName,
-        dateRange: editDates,
-        structureNotes: editNotes,
-        notifyEveryone,
-      }),
-    });
-    const json = await res.json();
-    if (!res.ok) {
-      setFeedback(json.error || "Update failed");
-      return;
-    }
-    setEditingId(null);
-    setFeedback(
-      notifyEveryone
-        ? `Saved & notified ${json.notifiedCount} user(s).`
-        : "Saved silently without sending notifications."
-    );
-    await loadOverview();
-  }
+  const canCreate = Boolean(
+    currentUser &&
+      ["SPORTS_SECRETARY", "FACULTY_ADVISOR"].includes(currentUser.role)
+  );
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
-    if (!currentUser) return;
-    const res = await fetch("/api/tournaments", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        actorUserId: currentUser.id,
-        name: newName,
-        year: Number(newYear),
-        semester: newSemester,
-        dateRange: newDates,
-        sportsIncluded: newSports,
-        structureNotes: newNotes,
-        notifyEveryone,
-      }),
-    });
-    const json = await res.json();
-    if (!res.ok) {
-      setFeedback(json.error || "Failed to add tournament");
-      return;
+    if (!currentUser || !name.trim()) return;
+    setSaving(true);
+    setMessage(null);
+    setErrorMsg(null);
+    try {
+      const res = await apiFetch("/api/tournaments", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name,
+          year,
+          semester,
+          tournamentType,
+          competitionFormat,
+          dateRange,
+          structureNotes,
+          sportsIncluded,
+          status: "UPCOMING",
+        }),
+      });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setErrorMsg(out.error || "Unable to create tournament.");
+        return;
+      }
+      setName("");
+      setMessage(`Created tournament "${out.tournament?.name || name}".`);
+      await load();
+    } catch {
+      setErrorMsg("Network error creating tournament.");
+    } finally {
+      setSaving(false);
     }
-    setNewName("");
-    setNewDates("");
-    setNewNotes("");
-    setFeedback(
-      notifyEveryone
-        ? `Tournament added & notified ${json.notifiedCount} user(s).`
-        : "Tournament added silently."
-    );
-    await loadOverview();
+  }
+
+  async function handleArchive(tournamentId: number, title: string) {
+    setArchivingId(tournamentId);
+    setMessage(null);
+    setErrorMsg(null);
+    try {
+      const res = await apiFetch(`/api/tournaments/${tournamentId}/archive`, {
+        method: "POST",
+      });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setErrorMsg(out.error || "Unable to archive tournament.");
+        return;
+      }
+      setMessage(`Archived "${title}".`);
+      await load();
+    } catch {
+      setErrorMsg("Network error archiving tournament.");
+    } finally {
+      setArchivingId(null);
+    }
   }
 
   return (
     <div className="container">
+      <h1 className="section-heading">Tournaments Overview</h1>
+      {loading && <p className="muted">Loading tournaments...</p>}
+      {message && <p style={{ color: "#d4a038" }}>{message}</p>}
+      {errorMsg && <p className="error-text">{errorMsg}</p>}
+
       <section className="panel">
-        <h1 className="section-heading">Upcoming & Active Tournaments Overview</h1>
-        <p className="muted">
-          Official IIITT semester sports calendar. Updated by the Sports Secretary.
-        </p>
-
-        {feedback && (
-          <p style={{ color: "#d4a038", fontSize: 13, marginTop: 10 }}>
-            {feedback}
-          </p>
-        )}
-
-        <ul className="list-clean" style={{ marginTop: 14 }}>
-          {tournaments.map((t) => (
-            <li key={t.id} className="list-item-row" style={{ display: "block" }}>
-              {editingId === t.id ? (
-                <div className="form-grid">
-                  <input
-                    value={editName}
-                    onChange={(e) => setEditName(e.target.value)}
-                    placeholder="Tournament Name"
-                  />
-                  <input
-                    value={editDates}
-                    onChange={(e) => setEditDates(e.target.value)}
-                    placeholder="Dates (e.g. Feb 12 – Feb 16, 2027)"
-                  />
-                  <input
-                    value={editNotes}
-                    onChange={(e) => setEditNotes(e.target.value)}
-                    placeholder="Structure / Notes"
-                  />
-                  <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
-                    <input
-                      type="checkbox"
-                      checked={notifyEveryone}
-                      onChange={(e) => setNotifyEveryone(e.target.checked)}
-                    />
-                    Notify everyone
-                  </label>
-                  <div style={{ display: "flex", gap: 8 }}>
+        <h2 className="section-heading">Active / Current</h2>
+        {current.length === 0 ? (
+          <p className="muted">No active tournament right now.</p>
+        ) : (
+          current.map((t) => (
+            <div key={t.id} className="notice-item" style={{ marginBottom: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                <strong>
+                  {t.name} ({t.year} · {t.semester} SEM)
+                </strong>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <Link to="/current-tournament" className="action-btn" style={{ textDecoration: "none", padding: "6px 10px", fontSize: 12 }}>
+                    Open Live Hub
+                  </Link>
+                  {canCreate && (
                     <button
                       type="button"
                       className="action-btn"
-                      onClick={() => saveEdit(t.id)}
+                      style={{ padding: "6px 10px", fontSize: 12, background: "#b91c1c", color: "#f4efe6" }}
+                      disabled={archivingId === t.id}
+                      onClick={() => handleArchive(t.id, t.name)}
                     >
-                      Save Changes
+                      {archivingId === t.id ? "Archiving..." : "Archive"}
                     </button>
-                    <button
-                      type="button"
-                      className="nav-pill"
-                      onClick={() => setEditingId(null)}
-                    >
-                      Cancel
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
-                  <div>
-                    <strong style={{ color: "#d4a038", fontSize: 15 }}>
-                      {t.name}
-                    </strong>{" "}
-                    <span className="muted">
-                      ({t.semester} Sem · {t.status})
-                    </span>
-                    <div style={{ marginTop: 4, fontSize: 13 }}>
-                      <strong>Dates:</strong> {t.dateRange}
-                    </div>
-                    <div className="muted" style={{ marginTop: 2 }}>
-                      Sports: {t.sportsIncluded}
-                    </div>
-                    {t.structureNotes && (
-                      <div className="muted" style={{ marginTop: 2 }}>
-                        {t.structureNotes}
-                      </div>
-                    )}
-                  </div>
-
-                  {isAdmin && (
-                    <div>
-                      <button
-                        type="button"
-                        className="action-btn"
-                        onClick={() => startEdit(t)}
-                      >
-                        Edit Dates / Details
-                      </button>
-                    </div>
                   )}
                 </div>
-              )}
-            </li>
-          ))}
-        </ul>
+              </div>
+              <p className="muted" style={{ margin: "6px 0" }}>
+                {t.dateRange} · {t.tournamentType} · {t.competitionFormat}
+              </p>
+              <p style={{ margin: "4px 0" }}>{t.structureNotes}</p>
+              <p className="muted" style={{ margin: 0 }}>
+                Sports: {t.sportsIncluded}
+              </p>
+            </div>
+          ))
+        )}
       </section>
 
-      {isAdmin && (
+      <section className="panel">
+        <h2 className="section-heading">Upcoming Tournaments</h2>
+        {upcoming.length === 0 ? (
+          <p className="muted">No upcoming tournaments scheduled.</p>
+        ) : (
+          upcoming.map((t) => (
+            <div key={t.id} className="notice-item" style={{ marginBottom: 12 }}>
+              <strong>
+                {t.name} ({t.year} · {t.semester} SEM)
+              </strong>
+              <p className="muted" style={{ margin: "6px 0" }}>
+                {t.dateRange} · {t.tournamentType} · {t.competitionFormat}
+              </p>
+              <p style={{ margin: "4px 0" }}>{t.structureNotes}</p>
+              <p className="muted" style={{ margin: 0 }}>
+                Sports: {t.sportsIncluded}
+              </p>
+            </div>
+          ))
+        )}
+      </section>
+
+      {canCreate && (
         <section className="panel">
-          <h2 className="section-heading">Add Upcoming Tournament (Sports Secretary)</h2>
+          <h2 className="section-heading">Schedule New Tournament</h2>
           <form onSubmit={handleCreate} className="form-grid">
             <input
-              required
               placeholder="Tournament Name"
-              value={newName}
-              onChange={(e) => setNewName(e.target.value)}
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              required
             />
             <input
+              type="number"
+              value={year}
+              onChange={(e) => setYear(Number(e.target.value))}
               required
-              placeholder="Year (e.g. 2027)"
-              value={newYear}
-              onChange={(e) => setNewYear(e.target.value)}
             />
             <select
-              value={newSemester}
-              onChange={(e) => setNewSemester(e.target.value)}
+              value={semester}
+              onChange={(e) => setSemester(e.target.value)}
             >
               <option value="ODD">Odd Semester</option>
               <option value="EVEN">Even Semester</option>
             </select>
+            <select
+              value={tournamentType}
+              onChange={(e) => setTournamentType(e.target.value)}
+            >
+              <option value="PROTHYMOS">Prothymos</option>
+              <option value="INTER_BATCH">Inter-Batch</option>
+            </select>
+            <select
+              value={competitionFormat}
+              onChange={(e) => setCompetitionFormat(e.target.value)}
+            >
+              <option value="LEAGUE_KNOCKOUT">League + Knockout</option>
+              <option value="KNOCKOUT">Knockout</option>
+              <option value="ROUND_ROBIN">Round Robin</option>
+            </select>
             <input
+              placeholder="Date Range"
+              value={dateRange}
+              onChange={(e) => setDateRange(e.target.value)}
               required
-              placeholder="Dates (e.g. Aug 20 – Aug 28, 2027)"
-              value={newDates}
-              onChange={(e) => setNewDates(e.target.value)}
             />
             <input
-              placeholder="Sports (comma-separated)"
-              value={newSports}
-              onChange={(e) => setNewSports(e.target.value)}
+              placeholder="Sports (comma separated)"
+              value={sportsIncluded}
+              onChange={(e) => setSportsIncluded(e.target.value)}
+              required
             />
             <input
-              placeholder="Format / Notes"
-              value={newNotes}
-              onChange={(e) => setNewNotes(e.target.value)}
+              placeholder="Schedule & Structure Notes"
+              value={structureNotes}
+              onChange={(e) => setStructureNotes(e.target.value)}
             />
-            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
-              <input
-                type="checkbox"
-                checked={notifyEveryone}
-                onChange={(e) => setNotifyEveryone(e.target.checked)}
-              />
-              Notify everyone
-            </label>
-            <button type="submit" className="action-btn">
-              Publish Tournament
+            <button type="submit" className="action-btn" disabled={saving}>
+              {saving ? "Creating..." : "Create Tournament"}
             </button>
           </form>
+        </section>
+      )}
+
+      {archived.length > 0 && (
+        <section className="panel">
+          <h2 className="section-heading">Archived Editions</h2>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            {archived.map((t) => (
+              <Link
+                key={t.id}
+                to={`/archive/${t.year}`}
+                className="status-tag"
+                style={{ textDecoration: "none" }}
+              >
+                {t.name} ({t.year})
+              </Link>
+            ))}
+          </div>
         </section>
       )}
     </div>

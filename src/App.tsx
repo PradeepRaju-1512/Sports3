@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { Link, Route, Routes, useNavigate } from "react-router-dom";
 import HomePage from "./pages/HomePage";
 import ClubPage from "./pages/ClubPage";
@@ -9,12 +9,14 @@ import LiveOrUpcomingPage from "./pages/LiveOrUpcomingPage";
 import AuctionPage from "./pages/AuctionPage";
 import LiveAuctionPage from "./pages/LiveAuctionPage";
 import LiveScorerPage from "./pages/LiveScorerPage";
+import PlayerProfilePage from "./pages/PlayerProfilePage";
+import { apiFetch, formatLocalDateTime, setAuthToken } from "./lib/api";
 
 export interface DemoUser {
   id: number;
   name: string;
-  email: string;
-  rollNumber: string | null;
+  email?: string;
+  rollNumber?: string | null;
   batch: string;
   branch: string;
   role: string;
@@ -38,51 +40,178 @@ export interface ClubItem {
   inductionOpen: boolean;
 }
 
+export interface NotificationItem {
+  id: number;
+  userId: number;
+  clubId: number | null;
+  message: string;
+  isRead: boolean;
+  createdAt: string;
+}
+
 export interface BootstrapData {
   demoSwitcherEnabled: boolean;
   alertBanner: string | null;
   notices: NoticeItem[];
   clubs: ClubItem[];
   users: DemoUser[];
-  defaultUser: DemoUser | null;
+  currentUser: DemoUser | null;
   hasLiveMatches: boolean;
   archiveYears: number[];
   auctionPlanned?: boolean;
   liveAuctionActive?: boolean;
+  auctionStatus?: string;
 }
 
 export default function App() {
   const [data, setData] = useState<BootstrapData | null>(null);
   const [currentUser, setCurrentUser] = useState<DemoUser | null>(null);
   const [archiveOpen, setArchiveOpen] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [notifOpen, setNotifOpen] = useState(false);
+  const [notifications, setNotifications] = useState<NotificationItem[]>([]);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [switchingRole, setSwitchingRole] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
   const navigate = useNavigate();
 
-  async function refreshBootstrap() {
+  const loadNotifications = useCallback(async () => {
     try {
-      const r = await fetch("/api/bootstrap", { cache: "no-store" });
+      const res = await apiFetch("/api/notifications", { cache: "no-store" });
+      if (!res.ok) {
+        setNotifications([]);
+        setUnreadCount(0);
+        return;
+      }
+      const d = await res.json();
+      setNotifications(d.notifications || []);
+      setUnreadCount(d.unreadCount || 0);
+    } catch {
+      // keep existing notifications on transient error
+    }
+  }, []);
+
+  const signInDemoUser = useCallback(
+    async (userId: number) => {
+      setSwitchingRole(true);
+      setAuthError(null);
+      try {
+        const res = await fetch("/api/auth/demo-login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ userId }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          setAuthError(err.error || "Unable to switch demo persona");
+          return;
+        }
+        const payload = await res.json();
+        setAuthToken(payload.token);
+        setCurrentUser(payload.user);
+        await loadNotifications();
+      } catch {
+        setAuthError("Network error switching persona");
+      } finally {
+        setSwitchingRole(false);
+      }
+    },
+    [loadNotifications]
+  );
+
+  const signOut = useCallback(() => {
+    setAuthToken(null);
+    setCurrentUser(null);
+    setNotifications([]);
+    setUnreadCount(0);
+    setNotifOpen(false);
+  }, []);
+
+  const refreshBootstrap = useCallback(async () => {
+    try {
+      const r = await apiFetch("/api/bootstrap", { cache: "no-store" });
+      if (!r.ok) return;
       const d: BootstrapData = await r.json();
       setData(d);
-      setCurrentUser((prev) => prev || d.defaultUser);
+      if (d.currentUser) {
+        setCurrentUser(d.currentUser);
+      }
     } catch (err) {
       console.error(err);
     }
-  }
+  }, []);
 
   useEffect(() => {
     refreshBootstrap();
-  }, []);
+  }, [refreshBootstrap]);
+
+  // Auto-authenticate first demo persona once when ENABLE_DEMO_SWITCHER=true and not yet signed in
+  const [autoLoginTried, setAutoLoginTried] = useState(false);
+  useEffect(() => {
+    if (
+      !autoLoginTried &&
+      data?.demoSwitcherEnabled &&
+      !currentUser &&
+      data.users.length > 0
+    ) {
+      setAutoLoginTried(true);
+      void signInDemoUser(data.users[0].id);
+    }
+  }, [autoLoginTried, data, currentUser, signInDemoUser]);
+
+  // Refresh notifications periodically when signed in
+  useEffect(() => {
+    if (!currentUser) return;
+    void loadNotifications();
+    const id = window.setInterval(() => {
+      void loadNotifications();
+    }, 30_000);
+    return () => window.clearInterval(id);
+  }, [currentUser, loadNotifications]);
+
+  async function markNotificationRead(id: number) {
+    try {
+      const res = await apiFetch(`/api/notifications/${id}/read`, {
+        method: "PATCH",
+      });
+      if (res.ok) {
+        setNotifications((prev) =>
+          prev.map((n) => (n.id === id ? { ...n, isRead: true } : n))
+        );
+        setUnreadCount((c) => Math.max(0, c - 1));
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  async function markAllRead() {
+    try {
+      const res = await apiFetch("/api/notifications/read-all", {
+        method: "POST",
+      });
+      if (res.ok) {
+        setNotifications((prev) => prev.map((n) => ({ ...n, isRead: true })));
+        setUnreadCount(0);
+      }
+    } catch {
+      // ignore
+    }
+  }
 
   const hasLive = Boolean(data?.hasLiveMatches);
   const archiveYears = data?.archiveYears || [2025, 2024];
-
-  // Show Auction tab when an auction is planned/open/frozen/live/published
   const auctionPlanned =
-    data?.auctionPlanned !== undefined ? Boolean(data.auctionPlanned) : true;
-  // Show Live Auction tab when live or active
+    data?.auctionPlanned !== undefined ? Boolean(data.auctionPlanned) : false;
   const liveAuctionActive =
     data?.liveAuctionActive !== undefined
       ? Boolean(data.liveAuctionActive)
-      : true;
+      : false;
+
+  const closeMenus = () => {
+    setMobileMenuOpen(false);
+    setArchiveOpen(false);
+  };
 
   return (
     <div>
@@ -91,65 +220,167 @@ export default function App() {
       )}
 
       <header className="topbar">
-        <nav className="nav-links">
-          <Link to="/">Home</Link>
-          <Link to="/overview">Overview</Link>
+        <div className="topbar-left">
+          <button
+            type="button"
+            className="mobile-menu-toggle"
+            aria-label="Toggle navigation menu"
+            aria-expanded={mobileMenuOpen}
+            onClick={() => setMobileMenuOpen((o) => !o)}
+          >
+            {mobileMenuOpen ? "✕" : "☰"}
+          </button>
 
-          <div className="dropdown-wrap">
-            <button
-              type="button"
-              className="nav-pill"
-              onClick={() => setArchiveOpen((o) => !o)}
-            >
-              Archive ▾
-            </button>
-            {archiveOpen && (
-              <div
-                className="dropdown-menu"
-                onClick={() => setArchiveOpen(false)}
+          <nav className={`nav-links ${mobileMenuOpen ? "open" : ""}`}>
+            <Link to="/" onClick={closeMenus}>
+              Home
+            </Link>
+            <Link to="/overview" onClick={closeMenus}>
+              Overview
+            </Link>
+
+            <div className="dropdown-wrap">
+              <button
+                type="button"
+                className="nav-pill"
+                onClick={() => setArchiveOpen((o) => !o)}
               >
-                {archiveYears.map((yr) => (
-                  <Link key={yr} to={`/archive/${yr}`}>
-                    {yr}
-                  </Link>
-                ))}
-              </div>
+                Archive ▾
+              </button>
+              {archiveOpen && (
+                <div className="dropdown-menu" onClick={closeMenus}>
+                  {archiveYears.map((yr) => (
+                    <Link key={yr} to={`/archive/${yr}`}>
+                      {yr}
+                    </Link>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <Link to="/current-tournament" onClick={closeMenus}>
+              Current Tournament
+            </Link>
+
+            {auctionPlanned && (
+              <Link to="/auction" onClick={closeMenus}>
+                Auction
+              </Link>
             )}
-          </div>
+            {liveAuctionActive && (
+              <Link to="/live-auction" onClick={closeMenus}>
+                Live Auction
+              </Link>
+            )}
 
-          <Link to="/current-tournament">Current Tournament</Link>
+            <Link to="/scorer" onClick={closeMenus}>
+              Match Scorer
+            </Link>
 
-          {auctionPlanned && <Link to="/auction">Auction</Link>}
-          {liveAuctionActive && <Link to="/live-auction">Live Auction</Link>}
+            <Link to={hasLive ? "/live" : "/upcoming"} onClick={closeMenus}>
+              {hasLive ? "Live" : "Upcoming"}
+            </Link>
+          </nav>
+        </div>
 
-          <Link to="/scorer">Match Scorer</Link>
+        <div className="topbar-right">
+          {currentUser && (
+            <div className="dropdown-wrap">
+              <button
+                type="button"
+                className="notif-bell-btn"
+                aria-label="Notifications"
+                onClick={() => {
+                  setNotifOpen((o) => !o);
+                  if (!notifOpen) void loadNotifications();
+                }}
+              >
+                🔔
+                {unreadCount > 0 && (
+                  <span className="notif-badge tabular-nums">{unreadCount}</span>
+                )}
+              </button>
 
-          <Link to={hasLive ? "/live" : "/upcoming"}>
-            {hasLive ? "Live" : "Upcoming"}
-          </Link>
-        </nav>
+              {notifOpen && (
+                <div className="notif-dropdown">
+                  <div className="notif-dropdown-header">
+                    <strong>Notifications</strong>
+                    {unreadCount > 0 && (
+                      <button
+                        type="button"
+                        className="notif-mark-all"
+                        onClick={markAllRead}
+                      >
+                        Mark all read
+                      </button>
+                    )}
+                  </div>
+                  {notifications.length === 0 ? (
+                    <p className="muted" style={{ padding: "10px 12px", margin: 0 }}>
+                      No notifications yet.
+                    </p>
+                  ) : (
+                    <div className="notif-list">
+                      {notifications.map((n) => (
+                        <div
+                          key={n.id}
+                          className={`notif-item ${n.isRead ? "read" : "unread"}`}
+                        >
+                          <div style={{ fontSize: 13 }}>{n.message}</div>
+                          <div className="notif-item-footer">
+                            <span className="muted" style={{ fontSize: 11 }}>
+                              {formatLocalDateTime(n.createdAt)}
+                            </span>
+                            {!n.isRead && (
+                              <button
+                                type="button"
+                                className="notif-read-btn"
+                                onClick={() => markNotificationRead(n.id)}
+                              >
+                                Mark read
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
 
-        {data?.demoSwitcherEnabled && currentUser && (
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span className="muted">Role:</span>
-            <select
-              value={currentUser.id}
-              onChange={(e) => {
-                const picked = data.users.find(
-                  (u) => u.id === Number(e.target.value)
-                );
-                if (picked) setCurrentUser(picked);
-              }}
-            >
-              {data.users.map((u) => (
-                <option key={u.id} value={u.id}>
-                  {u.name} ({u.role})
-                </option>
-              ))}
-            </select>
-          </div>
-        )}
+          {data?.demoSwitcherEnabled && (
+            <div className="role-switcher-wrap">
+              <span className="muted role-label">Role:</span>
+              <select
+                disabled={switchingRole}
+                value={currentUser ? String(currentUser.id) : "GUEST"}
+                onChange={(e) => {
+                  if (e.target.value === "GUEST") {
+                    signOut();
+                    return;
+                  }
+                  void signInDemoUser(Number(e.target.value));
+                }}
+              >
+                <option value="GUEST">Guest (Read-Only)</option>
+                {data.users.map((u) => (
+                  <option key={u.id} value={u.id}>
+                    {u.name} ({u.role})
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+        </div>
       </header>
+
+      {authError && (
+        <div className="container" style={{ paddingBottom: 0 }}>
+          <div className="error-banner">{authError}</div>
+        </div>
+      )}
 
       <Routes>
         <Route
@@ -220,6 +451,7 @@ export default function App() {
             />
           }
         />
+        <Route path="/players/:id" element={<PlayerProfilePage />} />
       </Routes>
     </div>
   );

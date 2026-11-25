@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
-import { useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
+import { formatLocalDateTime } from "../lib/api";
 
 interface ArchiveTournament {
   id: number;
@@ -29,6 +30,7 @@ interface ArchiveTeam {
 interface RosterMember {
   id: number;
   teamId: number;
+  userId?: number | null;
   playerName: string;
   playerRole: string;
   batchYear: string;
@@ -69,10 +71,19 @@ export default function ArchivePage({
   const [searchQuery, setSearchQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState("ALL");
   const [formatFilter, setFormatFilter] = useState("ALL");
+  const [loading, setLoading] = useState(true);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch(`/api/archive?year=${activeYear}`)
-      .then((r) => r.json())
+    setLoading(true);
+    setErrorMsg(null);
+    fetch(`/api/archive?year=${activeYear}`, { cache: "no-store" })
+      .then(async (r) => {
+        if (!r.ok) {
+          throw new Error("Unable to load archive");
+        }
+        return r.json();
+      })
       .then((json) => {
         const tList: ArchiveTournament[] = json.tournaments || [];
         setTournaments(tList);
@@ -91,7 +102,10 @@ export default function ArchivePage({
         }
         setSelectedTeamId(null);
       })
-      .catch(console.error);
+      .catch(() => {
+        setErrorMsg("Unable to load archived tournaments for this year.");
+      })
+      .finally(() => setLoading(false));
   }, [activeYear]);
 
   const filteredTournaments = tournaments.filter((t) => {
@@ -187,6 +201,8 @@ export default function ArchivePage({
           </select>
         </div>
 
+        {loading && <p className="muted">Loading {activeYear} archive...</p>}
+        {errorMsg && <p className="error-text">{errorMsg}</p>}
         {q && (
           <div
             style={{
@@ -208,7 +224,15 @@ export default function ArchivePage({
               const tm = teams.find((t) => t.id === pl.teamId);
               return (
                 <div key={pl.id} className="muted" style={{ marginTop: 4 }}>
-                  Player: <strong>{pl.playerName}</strong> — {pl.playerRole} ({pl.batchYear} · {pl.branch}) · Team: {tm?.teamName} ({tm?.sportName})
+                  Player:{" "}
+                  {pl.userId ? (
+                    <Link to={`/players/${pl.userId}`} className="player-link">
+                      <strong>{pl.playerName}</strong>
+                    </Link>
+                  ) : (
+                    <strong>{pl.playerName}</strong>
+                  )}{" "}
+                  — {pl.playerRole} ({pl.batchYear} · {pl.branch}) · Team: {tm?.teamName} ({tm?.sportName})
                 </div>
               );
             })}
@@ -366,7 +390,7 @@ export default function ArchivePage({
                   {sportMatches.map((m) => (
                     <li key={m.id} className="list-item-row" style={{ display: "block" }}>
                       <div style={{ color: "#d4a038", fontWeight: 700, fontSize: 12 }}>
-                        {m.stage} · {m.scheduledTime}
+                        {m.stage} · {formatLocalDateTime(m.scheduledTime)}
                       </div>
                       <div style={{ marginTop: 4 }}>
                         <strong>{m.teamA}</strong> ({m.scoreA}) vs{" "}
@@ -382,7 +406,7 @@ export default function ArchivePage({
             </section>
 
             <section className="panel">
-              <h2 className="section-heading">Teams & Squad Roster</h2>
+              <h2 className="section-heading">Teams &amp; Squad Roster</h2>
               {sportTeams.length === 0 ? (
                 <p className="muted">No teams recorded for {selectedSport}.</p>
               ) : (
@@ -407,7 +431,16 @@ export default function ArchivePage({
                         activeTeamMembers.map((mem) => (
                           <li key={mem.id} className="list-item-row">
                             <div>
-                              <strong>{mem.playerName}</strong>
+                              {mem.userId ? (
+                                <Link
+                                  to={`/players/${mem.userId}`}
+                                  className="player-link"
+                                >
+                                  <strong>{mem.playerName}</strong>
+                                </Link>
+                              ) : (
+                                <strong>{mem.playerName}</strong>
+                              )}
                               <div className="muted">{mem.playerRole}</div>
                             </div>
                             <span className="muted">

@@ -1950,6 +1950,7 @@ export function EventTimelinePanel({
   onStartEdit,
   onCancelEdit,
   onSaveEdit,
+  readOnly,
 }: {
   sport: SportId;
   roster: MatchRoster;
@@ -1958,6 +1959,7 @@ export function EventTimelinePanel({
   onStartEdit: (eventId: string) => void;
   onCancelEdit: () => void;
   onSaveEdit: (eventId: string, patch: Record<string, unknown>) => void;
+  readOnly?: boolean;
 }) {
   const [showVoided, setShowVoided] = useState(false);
   const sportDef = SPORT_REGISTRY[sport];
@@ -1985,13 +1987,14 @@ export function EventTimelinePanel({
 
       {displayed.length === 0 ? (
         <p className="muted" style={{ fontSize: 13 }}>
-          No events recorded yet. Use the live scoring pad to record match
-          events.
+          {readOnly
+            ? "No match events recorded yet."
+            : "No events recorded yet. Use the live scoring pad to record match events."}
         </p>
       ) : (
         <div className="scorer-timeline-list">
           {displayed.map((ev) => {
-            const isEditing = editingEventId === ev.eventId;
+            const isEditing = !readOnly && editingEventId === ev.eventId;
             return (
               <div
                 key={ev.eventId}
@@ -2007,7 +2010,7 @@ export function EventTimelinePanel({
                       {sportDef.formatEventLabel(ev, roster)}
                     </span>
                   </div>
-                  {!ev.voided && !isEditing && (
+                  {!readOnly && !ev.voided && !isEditing && (
                     <button
                       type="button"
                       className="scorer-edit-link"

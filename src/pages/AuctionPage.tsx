@@ -1,5 +1,11 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import type { DemoUser } from "../App";
+import {
+  apiFetch,
+  formatLocalDateTime,
+  toDateTimeLocalValue,
+} from "../lib/api";
 import type {
   AuctionConfig,
   AuctionPlayerStatus,
@@ -121,6 +127,8 @@ export default function AuctionPage({
   const [inductedSports, setInductedSports] = useState<string[]>([]);
   const [statusMsg, setStatusMsg] = useState("");
   const [errorMsg, setErrorMsg] = useState("");
+  const [submittingEnroll, setSubmittingEnroll] = useState(false);
+  const [busyAction, setBusyAction] = useState(false);
 
   // Student single-sport enrollment state (1 registration per sport; multiple positions allowed)
   const [yearLabel, setYearLabel] = useState(currentUser?.batch || "3rd Year");
@@ -209,7 +217,9 @@ export default function AuctionPage({
 
   function syncConfigForm(cfg: AuctionConfig) {
     setCfgName(cfg.name);
-    setCfgDeadline(cfg.registrationDeadline);
+    setCfgDeadline(
+      toDateTimeLocalValue(cfg.registrationDeadlineAt || cfg.registrationDeadline)
+    );
     setCfgClubBase(String(cfg.clubBasePrice));
     setCfgNonClubBase(String(cfg.nonClubBasePrice));
     setCfgDefaultInc(String(cfg.defaultIncrement));
@@ -236,34 +246,37 @@ export default function AuctionPage({
   }
 
   async function loadAuctionData() {
-    const query = currentUser ? `?userId=${currentUser.id}` : "";
-    const res = await fetch(`/api/auction${query}`, { cache: "no-store" });
-    if (!res.ok) return;
-    const data = await res.json();
-    const cfg: AuctionConfig | null = data.auction || null;
-    setAuction(cfg);
-    setRounds(data.rounds || []);
-    setRegistrations(data.registrations || []);
-    setFranchises(data.franchises || []);
-    setInductedSports(data.inductedSports || []);
-    if (cfg) {
-      syncConfigForm(cfg);
-      if (cfg.sports?.length) {
-        setSelectedSport((prev) =>
-          prev && cfg.sports.includes(prev) ? prev : cfg.sports[0]
-        );
-        setRosterSportTab((prev) =>
-          prev && cfg.sports.includes(prev) ? prev : cfg.sports[0]
-        );
-        setFranchiseSportFilter((prev) =>
-          prev === "ALL" || (prev && cfg.sports.includes(prev))
-            ? prev
-            : cfg.sports[0]
-        );
-        setNewFrSport((prev) =>
-          prev && cfg.sports.includes(prev) ? prev : cfg.sports[0]
-        );
+    try {
+      const res = await apiFetch("/api/auction");
+      if (!res.ok) return;
+      const data = await res.json();
+      const cfg: AuctionConfig | null = data.auction || null;
+      setAuction(cfg);
+      setRounds(data.rounds || []);
+      setRegistrations(data.registrations || []);
+      setFranchises(data.franchises || []);
+      setInductedSports(data.inductedSports || []);
+      if (cfg) {
+        syncConfigForm(cfg);
+        if (cfg.sports?.length) {
+          setSelectedSport((prev) =>
+            prev && cfg.sports.includes(prev) ? prev : cfg.sports[0]
+          );
+          setRosterSportTab((prev) =>
+            prev && cfg.sports.includes(prev) ? prev : cfg.sports[0]
+          );
+          setFranchiseSportFilter((prev) =>
+            prev === "ALL" || (prev && cfg.sports.includes(prev))
+              ? prev
+              : cfg.sports[0]
+          );
+          setNewFrSport((prev) =>
+            prev && cfg.sports.includes(prev) ? prev : cfg.sports[0]
+          );
+        }
       }
+    } catch {
+      showMessage("Unable to load auction data.", true);
     }
   }
 
@@ -356,30 +369,49 @@ export default function AuctionPage({
       return;
     }
 
-    const res = await fetch("/api/auction/registrations", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        userId: currentUser.id,
-        yearLabel,
-        branch,
-        sport: selectedSport,
-        positions: selectedPositions,
-        statsSummary,
-        photoUrl: photoDataUrl || null,
-      }),
-    });
-    const json = await res.json();
-    if (!res.ok) {
-      showMessage(json.error || "Could not submit sport registration.", true);
-      return;
+    setSubmittingEnroll(true);
+    try {
+      let uploadedPhotoUrl: string | null = null;
+      if (photoDataUrl) {
+        const upRes = await apiFetch("/api/uploads/player-photo", {
+          method: "POST",
+          body: JSON.stringify({ dataUrl: photoDataUrl }),
+        });
+        const upJson = await upRes.json().catch(() => ({}));
+        if (!upRes.ok) {
+          showMessage(upJson.error || "Photo upload failed.", true);
+          return;
+        }
+        uploadedPhotoUrl = upJson.photoUrl || null;
+      }
+
+      const res = await apiFetch("/api/auction/registrations", {
+        method: "POST",
+        body: JSON.stringify({
+          yearLabel,
+          branch,
+          sport: selectedSport,
+          positions: selectedPositions,
+          statsSummary,
+          photoUrl: uploadedPhotoUrl,
+        }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showMessage(json.error || "Could not submit sport registration.", true);
+        return;
+      }
+      setStatsSummary("");
+      handleClearPhoto();
+      showMessage(
+        `Enrolled in ${selectedSport} (${json.registration?.playerClass || currentPlayerClass}) at ₹${Number(json.registration?.basePrice || previewBasePrice).toLocaleString()} with positions: ${selectedPositions.join(", ")}.`
+      );
+      await loadAuctionData();
+    } catch {
+      showMessage("Network error while submitting registration.", true);
+    } finally {
+      setSubmittingEnroll(false);
     }
-    setStatsSummary("");
-    handleClearPhoto();
-    showMessage(
-      `Enrolled in ${selectedSport} (${json.registration?.playerClass || currentPlayerClass}) at ₹${Number(json.registration?.basePrice || previewBasePrice).toLocaleString()} with positions: ${selectedPositions.join(", ")}.`
-    );
-    await loadAuctionData();
   }
 
   async function handleAdminAction(
@@ -389,19 +421,26 @@ export default function AuctionPage({
     method: "POST" | "PATCH" | "DELETE" = "POST"
   ) {
     if (!currentUser) return false;
-    const res = await fetch(path, {
-      method,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ actorUserId: currentUser.id, ...body }),
-    });
-    const json = await res.json();
-    if (!res.ok) {
-      showMessage(json.error || "Action failed", true);
+    setBusyAction(true);
+    try {
+      const res = await apiFetch(path, {
+        method,
+        body: method === "DELETE" ? undefined : JSON.stringify(body),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        showMessage(json.error || "Action failed", true);
+        return false;
+      }
+      showMessage(successText);
+      await loadAuctionData();
+      return true;
+    } catch {
+      showMessage("Network error while saving auction changes.", true);
       return false;
+    } finally {
+      setBusyAction(false);
     }
-    showMessage(successText);
-    await loadAuctionData();
-    return true;
   }
 
   async function handleSaveConfig(e: React.FormEvent) {
@@ -442,11 +481,16 @@ export default function AuctionPage({
       }
     }
 
+    const deadlineIso = cfgDeadline
+      ? new Date(cfgDeadline).toISOString()
+      : "";
+
     await handleAdminAction(
       "/api/auction/config",
       {
         name: cfgName,
-        registrationDeadline: cfgDeadline,
+        registrationDeadline: deadlineIso,
+        registrationDeadlineAt: deadlineIso || null,
         sports: sportsList,
         clubBasePrice: Number(cfgClubBase),
         nonClubBasePrice: Number(cfgNonClubBase),
@@ -676,7 +720,10 @@ export default function AuctionPage({
             <h1 className="section-heading">{auction.name}</h1>
             <p className="muted tabular-nums">
               Status: <strong>{auction.status}</strong> · Deadline:{" "}
-              {auction.registrationDeadline} · Global Base:{" "}
+              {formatLocalDateTime(
+                auction.registrationDeadlineAt || auction.registrationDeadline
+              )}{" "}
+              · Global Base:{" "}
               <strong>₹{auction.clubBasePrice.toLocaleString()}</strong> CLUB /{" "}
               <strong>₹{auction.nonClubBasePrice.toLocaleString()}</strong>{" "}
               NON-CLUB · Inc:{" "}
@@ -887,8 +934,9 @@ export default function AuctionPage({
                   />
                 </label>
                 <label className="config-field">
-                  <span>Registration Deadline</span>
+                  <span>Registration Deadline (Local Time)</span>
                   <input
+                    type="datetime-local"
                     value={cfgDeadline}
                     onChange={(e) => setCfgDeadline(e.target.value)}
                   />
@@ -1064,8 +1112,8 @@ export default function AuctionPage({
               </div>
 
               <div style={{ display: "flex", justifyContent: "flex-end" }}>
-                <button type="submit" className="action-btn">
-                  Save Pricing, Quotas &amp; Sport Rules
+                <button type="submit" className="action-btn" disabled={busyAction}>
+                  {busyAction ? "Saving..." : "Save Pricing, Quotas & Sport Rules"}
                 </button>
               </div>
             </form>
@@ -1752,11 +1800,13 @@ export default function AuctionPage({
               <button
                 type="submit"
                 className="action-btn"
-                disabled={alreadyEnrolledInSport}
+                disabled={alreadyEnrolledInSport || submittingEnroll}
               >
-                {alreadyEnrolledInSport
-                  ? `Already Enrolled in ${selectedSport}`
-                  : `Enroll in ${selectedSport}`}
+                {submittingEnroll
+                  ? "Submitting..."
+                  : alreadyEnrolledInSport
+                    ? `Already Enrolled in ${selectedSport}`
+                    : `Enroll in ${selectedSport}`}
               </button>
             </div>
           </form>
@@ -1991,9 +2041,12 @@ export default function AuctionPage({
                         name={reg.playerName}
                       />
                       <div>
-                        <strong style={{ color: "#d4a038" }}>
+                        <Link
+                          to={`/players/${reg.userId}`}
+                          className="player-link"
+                        >
                           {reg.playerName}
-                        </strong>{" "}
+                        </Link>{" "}
                         <span className="muted">
                           · {reg.rollNumber} · {reg.yearLabel} · {reg.branch} ·{" "}
                           {reg.sport}

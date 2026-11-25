@@ -8,17 +8,26 @@ interface Props {
 }
 
 function ClubTile({ club }: { club: ClubItem }) {
-  const [imgFailed, setImgFailed] = useState(false);
+  const [srcStage, setSrcStage] = useState<"webp" | "png" | "fallback">("webp");
+
+  const imgSrc =
+    srcStage === "webp"
+      ? `/images/clubs/${club.slug}.webp`
+      : `/images/clubs/${club.slug}.png`;
 
   return (
     <Link to={`/clubs/${club.slug}`} className="club-card">
       <div className="club-thumb-wrap">
-        {!imgFailed ? (
+        {srcStage !== "fallback" ? (
           <img
-            src={`/images/clubs/${club.slug}.png`}
+            src={imgSrc}
             alt={club.name}
+            loading="lazy"
+            decoding="async"
             className="club-thumb"
-            onError={() => setImgFailed(true)}
+            onError={() =>
+              setSrcStage((prev) => (prev === "webp" ? "png" : "fallback"))
+            }
           />
         ) : (
           <div className="club-thumb-fallback">{club.name.slice(0, 2)}</div>
@@ -43,7 +52,10 @@ export default function HomePage({ data }: Props) {
     <div>
       <section
         className="hero-section"
-        style={{ backgroundImage: "url('/images/college.png')" }}
+        style={{
+          backgroundImage:
+            "image-set(url('/images/college.webp') type('image/webp'), url('/images/college.png') type('image/png'))",
+        }}
       >
         <div className="hero-vignette" />
         <div className="hero-content">
@@ -56,7 +68,7 @@ export default function HomePage({ data }: Props) {
 
       <main className="container">
         <section className="panel">
-          <h2 className="section-heading">Announcements & Notices</h2>
+          <h2 className="section-heading">Announcements &amp; Notices</h2>
           {!data ? (
             <p className="muted">Loading notices...</p>
           ) : (
@@ -75,7 +87,7 @@ export default function HomePage({ data }: Props) {
         </section>
 
         <section className="panel">
-          <h2 className="section-heading">Outdoor & Team Sports Clubs</h2>
+          <h2 className="section-heading">Outdoor &amp; Team Sports Clubs</h2>
           <div className="grid-3">
             {outdoorClubs.map((club) => (
               <ClubTile key={club.id} club={club} />

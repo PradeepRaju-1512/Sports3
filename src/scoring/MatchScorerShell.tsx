@@ -1,4 +1,5 @@
 import React from "react";
+import { Link } from "react-router-dom";
 import { ALL_SPORT_IDS, SPORT_REGISTRY, type AnySportState } from "./reducers";
 import {
   EventTimelinePanel,
@@ -27,9 +28,14 @@ export interface MatchScorerShellProps {
   onToggleClock: () => void;
   onResetClock: () => void;
   linkedMatchLabel?: string | null;
+  canEdit?: boolean;
   canPushLiveScore?: boolean;
   onPushLiveScore?: () => void;
+  onCompleteMatch?: () => void;
   pushFeedback?: string | null;
+  pushError?: string | null;
+  saving?: boolean;
+  syncStatusLabel?: string;
 }
 
 export function MatchScorerShell({
@@ -43,9 +49,14 @@ export function MatchScorerShell({
   onToggleClock,
   onResetClock,
   linkedMatchLabel,
+  canEdit = false,
   canPushLiveScore,
   onPushLiveScore,
+  onCompleteMatch,
   pushFeedback,
+  pushError,
+  saving = false,
+  syncStatusLabel,
 }: MatchScorerShellProps) {
   const { derived, viewport } = state;
   const sportDef = SPORT_REGISTRY[derived.sport];
@@ -54,9 +65,27 @@ export function MatchScorerShell({
     derived.roster
   );
   const nextSeq = allEvents.length + 1;
+  const readOnly = !canEdit;
+
+  const renderPlayerName = (p: {
+    id: string;
+    userId?: number | null;
+    name: string;
+    number?: string;
+  }) => {
+    const label = `${p.number ? `#${p.number} ` : ""}${p.name}`;
+    if (p.userId) {
+      return (
+        <Link to={`/players/${p.userId}`} className="player-link">
+          {label}
+        </Link>
+      );
+    }
+    return <span>{label}</span>;
+  };
 
   // ============================================================================
-  // MOBILE VIEWPORT SHELL (h-dvh, thumb-first pad, <=15% sticky bar, slide drawer)
+  // MOBILE VIEWPORT SHELL
   // ============================================================================
   if (viewport === "mobile") {
     const { drawerOpen, activeTab, editingEventId } = state.mobileUi;
@@ -87,13 +116,19 @@ export function MatchScorerShell({
             </select>
 
             <div className="scorer-mobile-clock-group">
-              <button
-                type="button"
-                className="scorer-clock-btn tabular-nums"
-                onClick={onToggleClock}
-              >
-                {clockRunning ? "❚❚" : "▶"} {formatClockMs(matchClockMs)}
-              </button>
+              {readOnly ? (
+                <span className="scorer-clock-btn tabular-nums">
+                  {formatClockMs(matchClockMs)}
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  className="scorer-clock-btn tabular-nums"
+                  onClick={onToggleClock}
+                >
+                  {clockRunning ? "❚❚" : "▶"} {formatClockMs(matchClockMs)}
+                </button>
+              )}
               <button
                 type="button"
                 className="scorer-viewport-switch"
@@ -121,19 +156,36 @@ export function MatchScorerShell({
               </strong>
             </div>
           </div>
-          <div className="scorer-status-strip">{summary.statusLine}</div>
+          <div className="scorer-status-strip">
+            {summary.statusLine}
+            {syncStatusLabel ? ` · ${syncStatusLabel}` : ""}
+          </div>
         </header>
 
         <main className="scorer-mobile-pad-area">
-          <SportActionPad
-            sport={derived.sport}
-            sportState={derived.sportState}
-            roster={derived.roster}
-            nextSeq={nextSeq}
-            matchClockMs={matchClockMs}
-            dispatch={dispatch}
-            compact={true}
-          />
+          {readOnly ? (
+            <div className="scorer-readonly-wrap">
+              <div className="readonly-banner">
+                Read-Only Spectator Scorecard — Only the assigned Match Scorer or
+                Sports Admin can record or edit live events.
+              </div>
+              <SportScorecardView
+                sport={derived.sport}
+                sportState={derived.sportState}
+                roster={derived.roster}
+              />
+            </div>
+          ) : (
+            <SportActionPad
+              sport={derived.sport}
+              sportState={derived.sportState}
+              roster={derived.roster}
+              nextSeq={nextSeq}
+              matchClockMs={matchClockMs}
+              dispatch={dispatch}
+              compact={true}
+            />
+          )}
         </main>
 
         {drawerOpen && (
@@ -143,7 +195,9 @@ export function MatchScorerShell({
                 {activeTab === "scorecard"
                   ? "Scorecard"
                   : activeTab === "timeline"
-                    ? "Timeline & Event Edit"
+                    ? readOnly
+                      ? "Event Timeline"
+                      : "Timeline & Event Edit"
                     : activeTab === "stats"
                       ? "Match Stats"
                       : "Match Controls"}
@@ -176,7 +230,9 @@ export function MatchScorerShell({
                   roster={derived.roster}
                   allEvents={allEvents}
                   editingEventId={editingEventId}
+                  readOnly={readOnly}
                   onStartEdit={(eventId) =>
+                    !readOnly &&
                     dispatch({
                       type: "SET_MOBILE_UI",
                       patch: { editingEventId: eventId },
@@ -189,6 +245,7 @@ export function MatchScorerShell({
                     })
                   }
                   onSaveEdit={(eventId, payloadPatch) => {
+                    if (readOnly) return;
                     dispatch({ type: "EDIT_EVENT", eventId, payloadPatch });
                     dispatch({
                       type: "SET_MOBILE_UI",
@@ -208,45 +265,77 @@ export function MatchScorerShell({
                 <div className="scorer-controls-panel">
                   {linkedMatchLabel && (
                     <div className="scorer-summary-line">
-                      Linked Live Fixture: <strong>{linkedMatchLabel}</strong>
+                      Linked Fixture: <strong>{linkedMatchLabel}</strong>
                     </div>
                   )}
-                  <div className="scorer-utility-row">
-                    <button
-                      type="button"
-                      className="scorer-util-btn"
-                      onClick={onToggleClock}
-                    >
-                      {clockRunning ? "Pause Clock" : "Start Clock"}
-                    </button>
-                    <button
-                      type="button"
-                      className="scorer-util-btn"
-                      onClick={onResetClock}
-                    >
-                      Reset Clock
-                    </button>
-                    <button
-                      type="button"
-                      className="scorer-util-btn accent-crimson"
-                      onClick={onResetMatch}
-                    >
-                      Clear Events
-                    </button>
-                  </div>
-                  {canPushLiveScore && onPushLiveScore && (
-                    <button
-                      type="button"
-                      className="action-btn"
-                      style={{ width: "100%", marginTop: 10 }}
-                      onClick={onPushLiveScore}
-                    >
-                      Push Derived Score to Live Tournament
-                    </button>
+                  {readOnly ? (
+                    <p className="muted" style={{ fontSize: 13 }}>
+                      Controls are locked in Read-Only mode.
+                    </p>
+                  ) : (
+                    <>
+                      <div className="scorer-utility-row">
+                        <button
+                          type="button"
+                          className="scorer-util-btn"
+                          onClick={onToggleClock}
+                        >
+                          {clockRunning ? "Pause Clock" : "Start Clock"}
+                        </button>
+                        <button
+                          type="button"
+                          className="scorer-util-btn"
+                          onClick={onResetClock}
+                        >
+                          Reset Clock
+                        </button>
+                        <button
+                          type="button"
+                          className="scorer-util-btn accent-crimson"
+                          onClick={onResetMatch}
+                        >
+                          Clear Events
+                        </button>
+                      </div>
+                      {canPushLiveScore && onPushLiveScore && (
+                        <button
+                          type="button"
+                          className="action-btn"
+                          disabled={saving}
+                          style={{ width: "100%", marginTop: 10 }}
+                          onClick={onPushLiveScore}
+                        >
+                          {saving
+                            ? "Syncing..."
+                            : "Save & Push Live Score"}
+                        </button>
+                      )}
+                      {canPushLiveScore && onCompleteMatch && (
+                        <button
+                          type="button"
+                          className="action-btn"
+                          disabled={saving}
+                          style={{
+                            width: "100%",
+                            marginTop: 8,
+                            background: "#b91c1c",
+                            color: "#f4efe6",
+                          }}
+                          onClick={onCompleteMatch}
+                        >
+                          Finalize Match &amp; Update Standings
+                        </button>
+                      )}
+                    </>
                   )}
                   {pushFeedback && (
                     <p style={{ color: "#d4a038", fontSize: 13, marginTop: 8 }}>
                       {pushFeedback}
+                    </p>
+                  )}
+                  {pushError && (
+                    <p className="error-text" style={{ marginTop: 8 }}>
+                      {pushError}
                     </p>
                   )}
                 </div>
@@ -256,14 +345,16 @@ export function MatchScorerShell({
         )}
 
         <footer className="scorer-mobile-bottom-bar">
-          <button
-            type="button"
-            className="scorer-undo-btn"
-            disabled={!derived.canUndo}
-            onClick={() => dispatch({ type: "UNDO_LAST" })}
-          >
-            Undo Last
-          </button>
+          {!readOnly && (
+            <button
+              type="button"
+              className="scorer-undo-btn"
+              disabled={!derived.canUndo}
+              onClick={() => dispatch({ type: "UNDO_LAST" })}
+            >
+              Undo Last
+            </button>
+          )}
           {(["scorecard", "timeline", "stats", "controls"] as MobileDrawerTab[]).map(
             (tab) => (
               <button
@@ -288,13 +379,12 @@ export function MatchScorerShell({
   }
 
   // ============================================================================
-  // PC COMMAND DESK SHELL (300px Roster/Sport | 1fr Live Pad | 360px Timeline)
+  // PC COMMAND DESK SHELL
   // ============================================================================
   const { rightTab, editingEventId } = state.pcUi;
 
   return (
     <div className="scorer-pc-shell">
-      {/* LEFT COLUMN: 300px Sport Switcher & Match Roster */}
       <aside className="scorer-pc-left">
         <div className="scorer-desk-block">
           <div className="scorer-desk-heading-row">
@@ -336,10 +426,7 @@ export function MatchScorerShell({
             <div className="scorer-roster-team">{derived.roster.teamAName}</div>
             {derived.roster.playersA.map((p) => (
               <div key={p.id} className="scorer-roster-row">
-                <span>
-                  {p.number ? `#${p.number} ` : ""}
-                  {p.name}
-                </span>
+                {renderPlayerName(p)}
                 <span className="muted">{p.role || ""}</span>
               </div>
             ))}
@@ -348,10 +435,7 @@ export function MatchScorerShell({
             <div className="scorer-roster-team">{derived.roster.teamBName}</div>
             {derived.roster.playersB.map((p) => (
               <div key={p.id} className="scorer-roster-row">
-                <span>
-                  {p.number ? `#${p.number} ` : ""}
-                  {p.name}
-                </span>
+                {renderPlayerName(p)}
                 <span className="muted">{p.role || ""}</span>
               </div>
             ))}
@@ -359,8 +443,14 @@ export function MatchScorerShell({
         </div>
       </aside>
 
-      {/* CENTER COLUMN: 1fr Broadcast Scoreboard, Clocks, Undo, Live Action Pad */}
       <main className="scorer-pc-center">
+        {readOnly && (
+          <div className="readonly-banner" style={{ marginBottom: 14 }}>
+            Read-Only Spectator Mode — Scoring controls, Undo, Reset, and Timeline
+            edits are restricted to the assigned Match Scorer or Sports Admin.
+          </div>
+        )}
+
         <section className="scorer-broadcast-card">
           <div className="scorer-broadcast-meta">
             <div>
@@ -368,26 +458,31 @@ export function MatchScorerShell({
               <span className="muted" style={{ marginLeft: 10, fontSize: 13 }}>
                 {derived.roster.stage || "Live Fixture"} ·{" "}
                 {derived.roster.venue || "IIITT Campus"}
+                {syncStatusLabel ? ` · ${syncStatusLabel}` : ""}
               </span>
             </div>
             <div className="scorer-clock-controls">
               <span className="scorer-clock-readout tabular-nums">
                 {formatClockMs(matchClockMs)}
               </span>
-              <button
-                type="button"
-                className="scorer-util-btn"
-                onClick={onToggleClock}
-              >
-                {clockRunning ? "Pause" : "Start"}
-              </button>
-              <button
-                type="button"
-                className="scorer-util-btn"
-                onClick={onResetClock}
-              >
-                Reset
-              </button>
+              {!readOnly && (
+                <>
+                  <button
+                    type="button"
+                    className="scorer-util-btn"
+                    onClick={onToggleClock}
+                  >
+                    {clockRunning ? "Pause" : "Start"}
+                  </button>
+                  <button
+                    type="button"
+                    className="scorer-util-btn"
+                    onClick={onResetClock}
+                  >
+                    Reset
+                  </button>
+                </>
+              )}
             </div>
           </div>
 
@@ -414,60 +509,96 @@ export function MatchScorerShell({
                 {summary.breakdown}
               </div>
             </div>
-            <div className="scorer-primary-actions">
-              <button
-                type="button"
-                className="scorer-undo-btn"
-                disabled={!derived.canUndo}
-                onClick={() => dispatch({ type: "UNDO_LAST" })}
-              >
-                Undo Last ({derived.activeEvents.length})
-              </button>
-              <button
-                type="button"
-                className="scorer-util-btn"
-                onClick={onResetMatch}
-              >
-                Reset Match
-              </button>
-              {canPushLiveScore && onPushLiveScore && (
+            {!readOnly && (
+              <div className="scorer-primary-actions">
                 <button
                   type="button"
-                  className="action-btn"
-                  onClick={onPushLiveScore}
+                  className="scorer-undo-btn"
+                  disabled={!derived.canUndo}
+                  onClick={() => dispatch({ type: "UNDO_LAST" })}
                 >
-                  Push to Live Feed
+                  Undo Last ({derived.activeEvents.length})
                 </button>
-              )}
-            </div>
+                <button
+                  type="button"
+                  className="scorer-util-btn"
+                  onClick={onResetMatch}
+                >
+                  Reset Match
+                </button>
+                {canPushLiveScore && onPushLiveScore && (
+                  <button
+                    type="button"
+                    className="action-btn"
+                    disabled={saving}
+                    onClick={onPushLiveScore}
+                  >
+                    {saving ? "Saving..." : "Save & Push Live"}
+                  </button>
+                )}
+                {canPushLiveScore && onCompleteMatch && (
+                  <button
+                    type="button"
+                    className="action-btn"
+                    disabled={saving}
+                    style={{ background: "#b91c1c", color: "#f4efe6" }}
+                    onClick={onCompleteMatch}
+                  >
+                    Complete Match
+                  </button>
+                )}
+              </div>
+            )}
           </div>
           {pushFeedback && (
             <div style={{ color: "#d4a038", fontSize: 13, marginTop: 8 }}>
               {pushFeedback}
             </div>
           )}
+          {pushError && (
+            <div className="error-text" style={{ marginTop: 8 }}>
+              {pushError}
+            </div>
+          )}
         </section>
 
         <section className="scorer-pad-card">
-          <div className="scorer-pad-card-header">
-            <h3 className="scorer-desk-heading">Live Scoring Pad</h3>
-            <span className="muted" style={{ fontSize: 12 }}>
-              Event-sourced · Deterministic fold · Zero state drift
-            </span>
-          </div>
-          <SportActionPad
-            sport={derived.sport}
-            sportState={derived.sportState}
-            roster={derived.roster}
-            nextSeq={nextSeq}
-            matchClockMs={matchClockMs}
-            dispatch={dispatch}
-            compact={false}
-          />
+          {readOnly ? (
+            <>
+              <div className="scorer-pad-card-header">
+                <h3 className="scorer-desk-heading">Live Scorecard</h3>
+                <span className="muted" style={{ fontSize: 12 }}>
+                  Read-only spectator view
+                </span>
+              </div>
+              <SportScorecardView
+                sport={derived.sport}
+                sportState={derived.sportState}
+                roster={derived.roster}
+              />
+            </>
+          ) : (
+            <>
+              <div className="scorer-pad-card-header">
+                <h3 className="scorer-desk-heading">Live Scoring Pad</h3>
+                <span className="muted" style={{ fontSize: 12 }}>
+                  Event-sourced · Auto-saved to server &amp; offline queue
+                </span>
+              </div>
+              <SportActionPad
+                sport={derived.sport}
+                sportState={derived.sportState}
+                roster={derived.roster}
+                nextSeq={nextSeq}
+                matchClockMs={matchClockMs}
+                dispatch={dispatch}
+                compact={false}
+              />
+            </>
+          )}
         </section>
       </main>
 
-      {/* RIGHT COLUMN: 360px Timeline (Inline Edit + Replay), Scorecard, Stats */}
       <aside className="scorer-pc-right">
         <div className="scorer-right-tabs">
           {(["timeline", "scorecard", "stats"] as PcRightTab[]).map((tab) => (
@@ -495,7 +626,9 @@ export function MatchScorerShell({
               roster={derived.roster}
               allEvents={allEvents}
               editingEventId={editingEventId}
+              readOnly={readOnly}
               onStartEdit={(eventId) =>
+                !readOnly &&
                 dispatch({
                   type: "SET_PC_UI",
                   patch: { editingEventId: eventId },
@@ -508,6 +641,7 @@ export function MatchScorerShell({
                 })
               }
               onSaveEdit={(eventId, payloadPatch) => {
+                if (readOnly) return;
                 dispatch({ type: "EDIT_EVENT", eventId, payloadPatch });
                 dispatch({
                   type: "SET_PC_UI",

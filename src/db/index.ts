@@ -31,14 +31,15 @@ const isLocal = connectionString
 export const pool: pg.Pool | null = connectionString
   ? new Pool({
       connectionString,
-      connectionTimeoutMillis: 2500,
+      connectionTimeoutMillis: 3000,
+      max: 20,
       ssl: isLocal ? false : { rejectUnauthorized: false },
     })
   : null;
 
 if (pool) {
-  pool.on("error", () => {
-    // Handled gracefully by API fallback without crashing the process
+  pool.on("error", (err) => {
+    console.error("PostgreSQL pool error:", err.message);
   });
 }
 

@@ -13,6 +13,7 @@ export type Side = "A" | "B";
 
 export interface PlayerProfile {
   id: string;
+  userId?: number | null;
   name: string;
   number?: string;
   role?: string;

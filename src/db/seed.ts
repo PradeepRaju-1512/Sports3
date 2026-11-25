@@ -11,6 +11,7 @@ import {
   tournaments,
   tournamentTeams,
   teamRosterMembers,
+  teamSubmissions,
   tournamentMatches,
   auctions,
   auctionRounds,
@@ -187,6 +188,14 @@ async function seed() {
       branch: "ECE",
       role: "STUDENT",
     },
+    {
+      name: "Devansh Kulkarni",
+      email: "devansh.23@iiitt.ac.in",
+      rollNumber: "CS23B1048",
+      batch: "3RD",
+      branch: "CSE",
+      role: "CAPTAIN",
+    },
   ];
 
   for (const u of sampleUsers) {
@@ -244,6 +253,8 @@ async function seed() {
     (u) => u.email === "siddharth.m25@iiitt.ac.in"
   );
   const applicant1st = allUsers.find((u) => u.email === "ananya.25@iiitt.ac.in");
+  const captainUser = allUsers.find((u) => u.email === "devansh.23@iiitt.ac.in");
+  const karthikUser = allUsers.find((u) => u.email === "karthik.22@iiitt.ac.in");
 
   const [{ value: existingMemberships }] = await db
     .select({ value: count() })
@@ -258,21 +269,31 @@ async function seed() {
     applicant1st
   ) {
     for (const club of allClubs) {
-      await db.insert(clubMemberships).values([
-        {
-          clubId: club.id,
-          userId: secUser.id,
-          memberRole: "SECRETARY",
-          batchScope: "ALL",
-          status: "INDUCTED",
-        },
-        {
-          clubId: club.id,
-          userId: coord2nd.id,
-          memberRole: "COORDINATOR",
-          batchScope: "2ND",
-          status: "INDUCTED",
-        },
+      const isAditiClub = club.slug === "cricket" || club.slug === "badminton";
+      const isRohanClub = club.slug === "cricket" || club.slug === "football";
+      const rows = [
+        ...(isAditiClub
+          ? [
+              {
+                clubId: club.id,
+                userId: secUser.id,
+                memberRole: "SECRETARY",
+                batchScope: "ALL",
+                status: "INDUCTED",
+              },
+            ]
+          : []),
+        ...(isRohanClub
+          ? [
+              {
+                clubId: club.id,
+                userId: coord2nd.id,
+                memberRole: "COORDINATOR",
+                batchScope: "2ND",
+                status: "INDUCTED",
+              },
+            ]
+          : []),
         {
           clubId: club.id,
           userId: member1st.id,
@@ -294,7 +315,8 @@ async function seed() {
           batchScope: "1ST",
           status: "APPLIED",
         },
-      ]);
+      ];
+      await db.insert(clubMemberships).values(rows).onConflictDoNothing();
     }
   }
 
@@ -303,23 +325,29 @@ async function seed() {
     .from(clubActivities);
 
   if (existingActivities === 0 && secUser) {
+    const todayAt5 = new Date();
+    todayAt5.setHours(17, 0, 0, 0);
+    const tomorrowAt430 = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    tomorrowAt430.setHours(16, 30, 0, 0);
     for (const club of allClubs) {
       await db.insert(clubActivities).values([
         {
           clubId: club.id,
           activityType: "Practice",
-          targetBatch: "4th Year",
+          targetBatch: "4TH",
           categoryGender: "Boys",
-          scheduledLabel: "Today, 5:00 PM",
+          scheduledLabel: todayAt5.toISOString(),
+          scheduledAt: todayAt5,
           venue: club.venue,
           createdByUserId: secUser.id,
         },
         {
           clubId: club.id,
           activityType: "Induction",
-          targetBatch: "All Batches",
+          targetBatch: "ALL",
           categoryGender: "Open",
-          scheduledLabel: "Tomorrow, 4:30 PM",
+          scheduledLabel: tomorrowAt430.toISOString(),
+          scheduledAt: tomorrowAt430,
           venue: club.venue,
           createdByUserId: secUser.id,
         },
@@ -407,68 +435,178 @@ async function seed() {
     void upcomingTourney;
 
     if (currentTourney) {
-      await db.insert(tournamentTeams).values([
-        {
-          tournamentId: currentTourney.id,
-          sportName: "Cricket",
-          teamName: "Trichy Titans",
-          placement: "NONE",
-          played: 2,
-          won: 2,
-          lost: 0,
-          drawn: 0,
-          points: 4,
-          nrrOrDiff: "+1.85",
-        },
-        {
-          tournamentId: currentTourney.id,
-          sportName: "Cricket",
-          teamName: "Cauvery Kings",
-          placement: "NONE",
-          played: 2,
-          won: 1,
-          lost: 1,
-          drawn: 0,
-          points: 2,
-          nrrOrDiff: "+0.42",
-        },
-        {
-          tournamentId: currentTourney.id,
-          sportName: "Cricket",
-          teamName: "Delta Dynamos",
-          placement: "NONE",
-          played: 2,
-          won: 0,
-          lost: 2,
-          drawn: 0,
-          points: 0,
-          nrrOrDiff: "-2.27",
-        },
-        {
-          tournamentId: currentTourney.id,
-          sportName: "Football",
-          teamName: "Kaveri United",
-          placement: "NONE",
-          played: 1,
-          won: 1,
-          lost: 0,
-          drawn: 0,
-          points: 3,
-          nrrOrDiff: "+2",
-        },
-        {
-          tournamentId: currentTourney.id,
-          sportName: "Football",
-          teamName: "Chola Rovers",
-          placement: "NONE",
-          played: 1,
-          won: 0,
-          lost: 1,
-          drawn: 0,
-          points: 0,
-          nrrOrDiff: "-2",
-        },
-      ]);
+      const insertedCurrentTeams = await db
+        .insert(tournamentTeams)
+        .values([
+          {
+            tournamentId: currentTourney.id,
+            sportName: "Cricket",
+            teamName: "Trichy Titans",
+            captainUserId: captainUser?.id || null,
+            placement: "NONE",
+            played: 2,
+            won: 2,
+            lost: 0,
+            drawn: 0,
+            points: 4,
+            nrrOrDiff: "+1.85",
+          },
+          {
+            tournamentId: currentTourney.id,
+            sportName: "Cricket",
+            teamName: "Cauvery Kings",
+            captainUserId: karthikUser?.id || null,
+            placement: "NONE",
+            played: 2,
+            won: 1,
+            lost: 1,
+            drawn: 0,
+            points: 2,
+            nrrOrDiff: "+0.42",
+          },
+          {
+            tournamentId: currentTourney.id,
+            sportName: "Cricket",
+            teamName: "Delta Dynamos",
+            captainUserId: coord2nd?.id || null,
+            placement: "NONE",
+            played: 2,
+            won: 0,
+            lost: 2,
+            drawn: 0,
+            points: 0,
+            nrrOrDiff: "-2.27",
+          },
+          {
+            tournamentId: currentTourney.id,
+            sportName: "Football",
+            teamName: "Kaveri United",
+            captainUserId: captainUser?.id || null,
+            placement: "NONE",
+            played: 1,
+            won: 1,
+            lost: 0,
+            drawn: 0,
+            points: 3,
+            nrrOrDiff: "+2",
+          },
+          {
+            tournamentId: currentTourney.id,
+            sportName: "Football",
+            teamName: "Chola Rovers",
+            captainUserId: memberMtech?.id || null,
+            placement: "NONE",
+            played: 1,
+            won: 0,
+            lost: 1,
+            drawn: 0,
+            points: 0,
+            nrrOrDiff: "-2",
+          },
+        ])
+        .returning();
+
+      const titansTeam = insertedCurrentTeams.find(
+        (t) => t.teamName === "Trichy Titans"
+      );
+      const kingsTeam = insertedCurrentTeams.find(
+        (t) => t.teamName === "Cauvery Kings"
+      );
+      const kaveriTeam = insertedCurrentTeams.find(
+        (t) => t.teamName === "Kaveri United"
+      );
+      if (titansTeam && kingsTeam) {
+        await db.insert(teamRosterMembers).values([
+          {
+            teamId: titansTeam.id,
+            userId: captainUser?.id || null,
+            playerName: "Devansh Kulkarni",
+            playerRole: "Captain / Batter",
+            batchYear: "3RD",
+            branch: "CSE",
+          },
+          {
+            teamId: titansTeam.id,
+            userId: coord2nd?.id || null,
+            playerName: "Rohan Verma",
+            playerRole: "All-Rounder",
+            batchYear: "2ND",
+            branch: "CSE",
+          },
+          {
+            teamId: titansTeam.id,
+            userId: member1st?.id || null,
+            playerName: "Meera Krishnan",
+            playerRole: "Bowler",
+            batchYear: "1ST",
+            branch: "MECH",
+          },
+          {
+            teamId: kingsTeam.id,
+            userId: karthikUser?.id || null,
+            playerName: "Karthik Nair",
+            playerRole: "Captain / Bowler",
+            batchYear: "4TH",
+            branch: "CSE",
+          },
+          {
+            teamId: kingsTeam.id,
+            userId: secUser?.id || null,
+            playerName: "Aditi Menon",
+            playerRole: "Wicketkeeper",
+            batchYear: "3RD",
+            branch: "ECE",
+          },
+          {
+            teamId: kingsTeam.id,
+            userId: applicant1st?.id || null,
+            playerName: "Ananya Reddy",
+            playerRole: "Batter",
+            batchYear: "1ST",
+            branch: "ECE",
+          },
+        ]);
+      }
+
+      if (captainUser && titansTeam) {
+        await db.insert(teamSubmissions).values([
+          {
+            tournamentId: currentTourney.id,
+            teamId: titansTeam.id,
+            sportName: "Cricket",
+            teamName: "Trichy Titans",
+            captainUserId: captainUser.id,
+            status: "APPROVED",
+            playersJson: JSON.stringify([
+              { userId: captainUser.id, name: "Devansh Kulkarni", role: "Captain / Batter", jersey: "7" },
+              { userId: coord2nd?.id, name: "Rohan Verma", role: "All-Rounder", jersey: "18" },
+              { userId: member1st?.id, name: "Meera Krishnan", role: "Bowler", jersey: "24" },
+            ]),
+            reviewerNotes: "Verified eligible squad for Odd Semester Championship.",
+          },
+          ...(kaveriTeam
+            ? [
+                {
+                  tournamentId: currentTourney.id,
+                  teamId: kaveriTeam.id,
+                  sportName: "Football",
+                  teamName: "Kaveri United",
+                  captainUserId: captainUser.id,
+                  status: "SUBMITTED",
+                  playersJson: JSON.stringify([
+                    { userId: captainUser.id, name: "Devansh Kulkarni", role: "Captain / Midfielder", jersey: "10" },
+                    { userId: memberMtech?.id, name: "Siddharth Iyer", role: "Striker", jersey: "9" },
+                  ]),
+                  reviewerNotes: "",
+                },
+              ]
+            : []),
+        ]);
+      }
+
+      const nowIso = new Date().toISOString();
+      const tomorrow5 = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      tomorrow5.setHours(17, 0, 0, 0);
 
       await db.insert(tournamentMatches).values([
         {
@@ -481,7 +619,8 @@ async function seed() {
           scoreA: "94/3 (11.2 ov)",
           scoreB: "Yet to bat",
           status: "LIVE",
-          scheduledTime: "Today · Live Now",
+          scheduledTime: nowIso,
+          scheduledAt: new Date(nowIso),
           venue: "IIITT Cricket Ground",
           resultSummary: "In Progress — Powerplay & middle overs underway",
           detailedBreakdown:
@@ -498,7 +637,8 @@ async function seed() {
           scoreA: "0",
           scoreB: "0",
           status: "UPCOMING",
-          scheduledTime: "Tomorrow, 5:00 PM",
+          scheduledTime: tomorrow5.toISOString(),
+          scheduledAt: tomorrow5,
           venue: "IIITT Cricket Ground",
           resultSummary: "Scheduled",
           detailedBreakdown: "15-over floodlight semi-final fixture.",
@@ -514,7 +654,8 @@ async function seed() {
           scoreA: "148/5 (15 ov)",
           scoreB: "112/8 (15 ov)",
           status: "COMPLETED",
-          scheduledTime: "22 Nov 2026",
+          scheduledTime: "2026-11-22T11:30:00.000Z",
+          scheduledAt: new Date("2026-11-22T11:30:00.000Z"),
           venue: "IIITT Cricket Ground",
           resultSummary: "Trichy Titans won by 36 runs",
           detailedBreakdown:
@@ -531,7 +672,8 @@ async function seed() {
           scoreA: "3",
           scoreB: "1",
           status: "COMPLETED",
-          scheduledTime: "21 Nov 2026",
+          scheduledTime: "2026-11-21T11:30:00.000Z",
+          scheduledAt: new Date("2026-11-21T11:30:00.000Z"),
           venue: "Main Football Ground",
           resultSummary: "Kaveri United won by 2 goals",
           detailedBreakdown:
@@ -794,7 +936,8 @@ async function seed() {
           "Kabaddi",
         ]),
         status: "REGISTRATION_OPEN",
-        registrationDeadline: "Feb 08, 2027 · 11:59 PM",
+        registrationDeadline: "2027-02-08T18:29:00.000Z",
+        registrationDeadlineAt: new Date("2027-02-08T18:29:00.000Z"),
         clubBasePrice: 10000,
         nonClubBasePrice: 5000,
         sportBasePricesJson: JSON.stringify({

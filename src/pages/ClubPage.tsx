@@ -1,374 +1,528 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import type { DemoUser } from "../App";
+import { apiFetch, formatLocalDateTime, toDateTimeLocalValue } from "../lib/api";
 
-interface ClubDetail {
+interface ClubMember {
   id: number;
-  slug: string;
-  name: string;
-  groupType: string;
-  description: string;
-  venue: string;
-}
-
-interface ActivityRow {
-  id: number;
-  activityType: string;
-  targetBatch: string;
-  categoryGender: string;
-  scheduledLabel: string;
-  venue: string;
-}
-
-interface MembershipRow {
-  id: number;
+  clubId: number;
   userId: number;
   memberRole: string;
   batchScope: string;
   status: string;
   userName: string;
-  userEmail: string;
   userBatch: string;
   userBranch: string;
-  userRoll: string | null;
 }
 
-interface NotifRow {
+interface ClubActivity {
   id: number;
-  message: string;
-  createdAt: string;
+  activityType: string;
+  targetBatch: string;
+  categoryGender: string;
+  scheduledLabel: string;
+  scheduledAt?: string | null;
+  venue: string;
 }
 
-export default function ClubPage({ currentUser }: { currentUser: DemoUser | null }) {
-  const { slug } = useParams<{ slug: string }>();
-  const [club, setClub] = useState<ClubDetail | null>(null);
-  const [activities, setActivities] = useState<ActivityRow[]>([]);
-  const [memberships, setMemberships] = useState<MembershipRow[]>([]);
-  const [myNotifs, setMyNotifs] = useState<NotifRow[]>([]);
-  const [statusMsg, setStatusMsg] = useState<string>("");
+interface ClubDetailResponse {
+  club: {
+    id: number;
+    slug: string;
+    name: string;
+    groupType: string;
+    description: string;
+    venue: string;
+    inductionOpen: boolean;
+  };
+  members: ClubMember[];
+  activities: ClubActivity[];
+  notifications: Array<{
+    id: number;
+    message: string;
+    isRead: boolean;
+  }>;
+  canManageClub: boolean;
+  manageBatchScope: string;
+}
+
+export default function ClubPage({
+  currentUser,
+}: {
+  currentUser: DemoUser | null;
+}) {
+  const { slug } = useParams();
+  const [detail, setDetail] = useState<ClubDetailResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [busyAction, setBusyAction] = useState<string | null>(null);
 
   const [activityType, setActivityType] = useState("Practice");
-  const [customActivityText, setCustomActivityText] = useState("");
-  const [targetBatch, setTargetBatch] = useState("4th Year");
-  const [categoryGender, setCategoryGender] = useState("Boys");
-  const [scheduledLabel, setScheduledLabel] = useState("Today, 5:00 PM");
+  const [targetBatch, setTargetBatch] = useState("ALL");
+  const [categoryGender, setCategoryGender] = useState("Open");
+  const [scheduledAt, setScheduledAt] = useState(() =>
+    toDateTimeLocalValue(new Date(Date.now() + 2 * 3600_000).toISOString())
+  );
   const [venue, setVenue] = useState("");
 
-  async function loadClub() {
-    if (!slug) return;
-    const res = await fetch(`/api/clubs/${slug}`);
-    if (!res.ok) return;
-    const json = await res.json();
-    setClub(json.club);
-    setActivities(json.activities || []);
-    setMemberships(json.memberships || []);
-    if (!venue && json.club?.venue) {
-      setVenue(json.club.venue);
+  const load = useCallback(async () => {
+    setLoadError(null);
+    try {
+      const res = await apiFetch(`/api/clubs/${slug}`, { cache: "no-store" });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        setLoadError(err.error || "Unable to load club details.");
+        setLoading(false);
+        return;
+      }
+      const d: ClubDetailResponse = await res.json();
+      setDetail(d);
+      setVenue((v) => v || d.club.venue);
+      if (d.manageBatchScope && d.manageBatchScope !== "ALL" && d.manageBatchScope !== "NONE") {
+        setTargetBatch(d.manageBatchScope);
+      }
+    } catch {
+      setLoadError("Network error while loading club details.");
+    } finally {
+      setLoading(false);
     }
-  }
-
-  async function loadNotifs() {
-    if (!currentUser) return;
-    const res = await fetch(`/api/notifications?userId=${currentUser.id}`);
-    if (!res.ok) return;
-    const json = await res.json();
-    setMyNotifs(json.notifications || []);
-  }
-
-  useEffect(() => {
-    loadClub();
   }, [slug]);
 
   useEffect(() => {
-    loadNotifs();
-  }, [currentUser?.id, activities.length]);
+    setLoading(true);
+    void load();
+  }, [load, currentUser?.id]);
 
-  const canManage =
-    currentUser &&
-    (["SPORTS_SECRETARY", "FACULTY_ADVISOR", "CLUB_SECRETARY", "CLUB_COORDINATOR"].includes(
-      currentUser.role
-    ) ||
-      memberships.some(
-        (m) =>
-          m.userId === currentUser.id &&
-          ["SECRETARY", "COORDINATOR"].includes(m.memberRole)
-      ));
-
-  async function handleAddActivity(e: React.FormEvent) {
+  async function handleSchedule(e: React.FormEvent) {
     e.preventDefault();
-    if (!slug || !currentUser) return;
-    setStatusMsg("");
-    const res = await fetch(`/api/clubs/${slug}/activities`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        actorUserId: currentUser.id,
-        activityType,
-        customActivityText,
-        targetBatch,
-        categoryGender,
-        scheduledLabel,
-        venue,
-      }),
-    });
-    const json = await res.json();
-    if (!res.ok) {
-      setStatusMsg(json.error || "Could not post activity");
-      return;
+    if (!currentUser || !detail) return;
+    setBusyAction("schedule");
+    setMessage(null);
+    setErrorMsg(null);
+    try {
+      const iso = scheduledAt ? new Date(scheduledAt).toISOString() : undefined;
+      const res = await apiFetch(`/api/clubs/${slug}/activities`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          activityType,
+          targetBatch,
+          categoryGender,
+          scheduledAt: iso,
+          venue: venue || detail.club.venue,
+        }),
+      });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setErrorMsg(out.error || "Unable to schedule activity.");
+        return;
+      }
+      setMessage(
+        `Scheduled ${activityType} (${targetBatch}) and notified ${out.notifiedCount ?? 0} club members.`
+      );
+      await load();
+    } catch {
+      setErrorMsg("Network error while scheduling activity.");
+    } finally {
+      setBusyAction(null);
     }
-    setStatusMsg(`Activity posted & notified ${json.notifiedCount} member(s).`);
-    setCustomActivityText("");
-    await loadClub();
-    await loadNotifs();
+  }
+
+  async function handleToggleInduction() {
+    if (!detail) return;
+    setBusyAction("toggle-induction");
+    setMessage(null);
+    setErrorMsg(null);
+    try {
+      const res = await apiFetch(`/api/clubs/${slug}/induction-toggle`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ inductionOpen: !detail.club.inductionOpen }),
+      });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setErrorMsg(out.error || "Unable to toggle induction status.");
+        return;
+      }
+      setMessage(
+        `Club inductions are now ${!detail.club.inductionOpen ? "OPEN" : "CLOSED"}.`
+      );
+      await load();
+    } catch {
+      setErrorMsg("Network error toggling induction status.");
+    } finally {
+      setBusyAction(null);
+    }
   }
 
   async function handleApplyInduction() {
-    if (!slug || !currentUser) return;
-    const res = await fetch(`/api/clubs/${slug}/induction-apply`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ userId: currentUser.id }),
-    });
-    if (res.ok) {
-      setStatusMsg("Induction request submitted for approval.");
-      await loadClub();
+    if (!currentUser) {
+      setErrorMsg("Sign in to apply for club induction.");
+      return;
+    }
+    setBusyAction("apply");
+    setMessage(null);
+    setErrorMsg(null);
+    try {
+      const res = await apiFetch(`/api/clubs/${slug}/induction-apply`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setErrorMsg(out.error || "Unable to submit induction application.");
+        return;
+      }
+      setMessage(
+        out.message || "Induction application submitted! Check club trials schedule."
+      );
+      await load();
+    } catch {
+      setErrorMsg("Network error while submitting application.");
+    } finally {
+      setBusyAction(null);
     }
   }
 
-  async function handleStatusChange(membershipId: number, status: string) {
-    if (!currentUser) return;
-    const res = await fetch(`/api/memberships/${membershipId}/status`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ actorUserId: currentUser.id, status }),
-    });
-    if (res.ok) {
-      await loadClub();
+  async function handleStatusUpdate(membershipId: number, status: string) {
+    setBusyAction(`mem-${membershipId}-${status}`);
+    setMessage(null);
+    setErrorMsg(null);
+    try {
+      const res = await apiFetch(`/api/memberships/${membershipId}/status`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status }),
+      });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setErrorMsg(out.error || "Unable to update membership status.");
+        return;
+      }
+      setMessage(`Applicant status updated to ${status}.`);
+      await load();
+    } catch {
+      setErrorMsg("Network error updating applicant status.");
+    } finally {
+      setBusyAction(null);
     }
   }
 
-  if (!club) {
+  if (loading) {
     return (
       <div className="container">
-        <p className="muted">Loading club...</p>
+        <p className="muted">Loading club workspace...</p>
       </div>
     );
   }
 
-  const secretary = memberships.find((m) => m.memberRole === "SECRETARY");
-  const coordinators = memberships.filter((m) => m.memberRole === "COORDINATOR");
-  const inductedMembers = memberships.filter(
-    (m) => m.memberRole === "MEMBER" && m.status === "INDUCTED"
+  if (loadError || !detail) {
+    return (
+      <div className="container">
+        <div className="panel">
+          <p className="error-text">{loadError || "Club not found."}</p>
+        </div>
+      </div>
+    );
+  }
+
+  const canManage = detail.canManageClub;
+  const scope = detail.manageBatchScope;
+  const inductedMembers = detail.members.filter((m) => m.status === "INDUCTED");
+  const pipelineApplicants = detail.members.filter(
+    (m) => m.status === "APPLIED" || m.status === "TRIAL_ATTENDED"
   );
-  const pendingApplicants = memberships.filter((m) => m.status === "APPLIED");
+  const myMembership = currentUser
+    ? detail.members.find((m) => m.userId === currentUser.id)
+    : null;
 
   return (
     <div className="container">
-      <div style={{ marginBottom: 14 }}>
-        <Link to="/" className="muted">
-          ← Back to IIIT TRICHY SPORTS
-        </Link>
-      </div>
-
-      <section className="panel">
-        <h1 className="club-name" style={{ fontSize: "2rem" }}>
-          {club.name} Club
-        </h1>
-        <p className="muted">{club.description}</p>
-
-        <h2 className="section-heading" style={{ marginTop: 20 }}>
-          Upcoming Activities
-        </h2>
-        <ul className="list-clean">
-          {activities.map((a) => (
-            <li key={a.id} className="list-item-row">
-              <div>
-                <strong>{a.activityType}</strong> · {a.targetBatch} · {a.categoryGender}
-              </div>
-              <div className="muted">
-                {a.scheduledLabel} · {a.venue}
-              </div>
-            </li>
-          ))}
-        </ul>
-
-        {canManage && (
-          <form onSubmit={handleAddActivity} style={{ marginTop: 18 }}>
-            <h3 className="club-name" style={{ fontSize: "0.95rem" }}>
-              Schedule Activity & Notify Club Members
-            </h3>
-            <div className="form-grid">
-              <select
-                value={activityType}
-                onChange={(e) => setActivityType(e.target.value)}
+      <div className="panel">
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "flex-start",
+            flexWrap: "wrap",
+            gap: 12,
+          }}
+        >
+          <div>
+            <h1 style={{ margin: 0, textTransform: "uppercase", color: "#d4a038" }}>
+              {detail.club.name} Club
+            </h1>
+            <p style={{ margin: "8px 0" }}>{detail.club.description}</p>
+            <p className="muted" style={{ margin: 0 }}>
+              Primary Venue: {detail.club.venue} · Inductions:{" "}
+              <strong
+                style={{
+                  color: detail.club.inductionOpen ? "#4ade80" : "#f87171",
+                }}
               >
-                <option value="Practice">Practice</option>
-                <option value="Induction">Induction</option>
-                <option value="Meeting">Meeting</option>
-                <option value="Other">Other (Custom)</option>
-              </select>
-
-              {activityType === "Other" && (
-                <input
-                  type="text"
-                  placeholder="Enter custom activity"
-                  value={customActivityText}
-                  onChange={(e) => setCustomActivityText(e.target.value)}
-                  required
-                />
+                {detail.club.inductionOpen ? "OPEN" : "CLOSED"}
+              </strong>
+              {canManage && scope !== "NONE" && (
+                <span> · Your Management Scope: {scope}</span>
               )}
-
-              <select
-                value={targetBatch}
-                onChange={(e) => setTargetBatch(e.target.value)}
-              >
-                <option value="1st Year">1st Year</option>
-                <option value="2nd Year">2nd Year</option>
-                <option value="3rd Year">3rd Year</option>
-                <option value="4th Year">4th Year</option>
-                <option value="MTech">MTech</option>
-                <option value="All Batches">All Batches</option>
-              </select>
-
-              <select
-                value={categoryGender}
-                onChange={(e) => setCategoryGender(e.target.value)}
-              >
-                <option value="Boys">Boys</option>
-                <option value="Girls">Girls</option>
-                <option value="Open">Open</option>
-              </select>
-
-              <input
-                type="text"
-                placeholder="When (e.g. Today, 5:00 PM)"
-                value={scheduledLabel}
-                onChange={(e) => setScheduledLabel(e.target.value)}
-              />
-
-              <input
-                type="text"
-                placeholder="Venue"
-                value={venue}
-                onChange={(e) => setVenue(e.target.value)}
-              />
-
-              <button type="submit" className="action-btn">
-                Post & Notify
-              </button>
-            </div>
-          </form>
-        )}
-
-        {statusMsg && (
-          <p style={{ color: "#d4a038", marginTop: 10, fontSize: 13 }}>
-            {statusMsg}
-          </p>
-        )}
-      </section>
-
-      <section className="panel">
-        <h2 className="section-heading">Club Secretary</h2>
-        {secretary ? (
-          <div className="list-item-row">
-            <strong>{secretary.userName}</strong>
-            <span className="muted">
-              {secretary.userBatch} · {secretary.userBranch}
-            </span>
+            </p>
           </div>
-        ) : (
-          <p className="muted">Not assigned yet.</p>
-        )}
 
-        <h2 className="section-heading" style={{ marginTop: 22 }}>
-          Year-Wise Club Coordinators
-        </h2>
-        <ul className="list-clean">
-          {coordinators.map((c) => (
-            <li key={c.id} className="list-item-row">
-              <strong>{c.userName}</strong>
-              <span className="muted">
-                Batch Scope: {c.batchScope} · {c.userBranch}
-              </span>
-            </li>
-          ))}
-        </ul>
-
-        <h2 className="section-heading" style={{ marginTop: 22 }}>
-          Club Members ({inductedMembers.length})
-        </h2>
-        <ul className="list-clean">
-          {inductedMembers.map((m) => (
-            <li key={m.id} className="list-item-row">
-              <span>{m.userName}</span>
-              <span className="muted">
-                {m.userBatch} · {m.userBranch}
-              </span>
-            </li>
-          ))}
-        </ul>
-
-        {currentUser &&
-          !memberships.some((m) => m.userId === currentUser.id) && (
-            <div style={{ marginTop: 14 }}>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {canManage && scope === "ALL" && (
               <button
                 type="button"
                 className="action-btn"
+                disabled={busyAction !== null}
+                onClick={handleToggleInduction}
+              >
+                {busyAction === "toggle-induction"
+                  ? "Updating..."
+                  : detail.club.inductionOpen
+                    ? "Close Inductions"
+                    : "Open Inductions"}
+              </button>
+            )}
+            {currentUser && !myMembership && (
+              <button
+                type="button"
+                className="action-btn"
+                disabled={!detail.club.inductionOpen || busyAction !== null}
                 onClick={handleApplyInduction}
               >
-                Apply for Club Induction
+                {busyAction === "apply"
+                  ? "Submitting..."
+                  : detail.club.inductionOpen
+                    ? "Apply for Induction"
+                    : "Inductions Closed"}
               </button>
-            </div>
-          )}
+            )}
+            {myMembership && (
+              <span className="status-tag">
+                Your Status: {myMembership.status} ({myMembership.memberRole})
+              </span>
+            )}
+          </div>
+        </div>
 
-        {canManage && pendingApplicants.length > 0 && (
-          <div style={{ marginTop: 20 }}>
-            <h3 className="club-name" style={{ fontSize: "0.95rem" }}>
-              Pending Induction Applications
-            </h3>
-            <ul className="list-clean">
-              {pendingApplicants.map((p) => (
-                <li key={p.id} className="list-item-row">
-                  <span>
-                    {p.userName} ({p.userBatch} · {p.userBranch})
+        {message && (
+          <p style={{ color: "#d4a038", marginTop: 12, marginBottom: 0 }}>
+            {message}
+          </p>
+        )}
+        {errorMsg && (
+          <p className="error-text" style={{ marginTop: 12, marginBottom: 0 }}>
+            {errorMsg}
+          </p>
+        )}
+      </div>
+
+      {canManage && (
+        <section className="panel">
+          <h2 className="section-heading">Schedule Practice / Trial / Induction</h2>
+          <p className="muted" style={{ marginTop: 0 }}>
+            {scope === "ALL"
+              ? "You can schedule sessions for any batch in this club."
+              : `Your coordinator scope is limited to batch ${scope} in ${detail.club.name}.`}
+          </p>
+          <form onSubmit={handleSchedule} className="form-grid">
+            <select
+              value={activityType}
+              onChange={(e) => setActivityType(e.target.value)}
+            >
+              <option value="Practice">Practice</option>
+              <option value="Trial">Trial</option>
+              <option value="Induction">Induction</option>
+              <option value="Friendly Match">Friendly Match</option>
+            </select>
+
+            <select
+              value={targetBatch}
+              onChange={(e) => setTargetBatch(e.target.value)}
+            >
+              {scope === "ALL" ? (
+                <>
+                  <option value="ALL">All Batches</option>
+                  <option value="1ST">1st Year</option>
+                  <option value="2ND">2nd Year</option>
+                  <option value="3RD">3rd Year</option>
+                  <option value="4TH">4th Year</option>
+                  <option value="MTECH">MTech</option>
+                </>
+              ) : (
+                <option value={scope}>{scope} Batch</option>
+              )}
+            </select>
+
+            <select
+              value={categoryGender}
+              onChange={(e) => setCategoryGender(e.target.value)}
+            >
+              <option value="Open">Open</option>
+              <option value="Boys">Boys</option>
+              <option value="Girls">Girls</option>
+              <option value="Mixed">Mixed</option>
+            </select>
+
+            <input
+              type="datetime-local"
+              value={scheduledAt}
+              onChange={(e) => setScheduledAt(e.target.value)}
+              required
+            />
+
+            <input
+              placeholder="Venue"
+              value={venue}
+              onChange={(e) => setVenue(e.target.value)}
+              required
+            />
+
+            <button
+              type="submit"
+              className="action-btn"
+              disabled={busyAction !== null}
+            >
+              {busyAction === "schedule" ? "Scheduling..." : "Publish & Notify"}
+            </button>
+          </form>
+        </section>
+      )}
+
+      <section className="panel">
+        <h2 className="section-heading">Scheduled Sessions &amp; Trials</h2>
+        {detail.activities.length === 0 ? (
+          <p className="muted">No upcoming sessions scheduled yet.</p>
+        ) : (
+          <div style={{ display: "grid", gap: 10 }}>
+            {detail.activities.map((a) => (
+              <div key={a.id} className="notice-item">
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+                  <strong>
+                    {a.activityType} · {a.targetBatch} · {a.categoryGender}
+                  </strong>
+                  <span style={{ color: "#d4a038", fontWeight: 700 }}>
+                    {formatLocalDateTime(a.scheduledAt || a.scheduledLabel)}
                   </span>
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <button
-                      type="button"
-                      className="action-btn"
-                      onClick={() => handleStatusChange(p.id, "INDUCTED")}
-                    >
-                      Approve
-                    </button>
-                    <button
-                      type="button"
-                      className="nav-pill"
-                      onClick={() => handleStatusChange(p.id, "REJECTED")}
-                    >
-                      Reject
-                    </button>
-                  </div>
-                </li>
-              ))}
-            </ul>
+                </div>
+                <div className="muted">Venue: {a.venue}</div>
+              </div>
+            ))}
           </div>
         )}
       </section>
 
       <section className="panel">
-        <h2 className="section-heading">My Club Notifications</h2>
-        {myNotifs.length === 0 ? (
-          <p className="muted">No notifications for the active role yet.</p>
+        <h2 className="section-heading">
+          Induction Pipeline ({pipelineApplicants.length})
+        </h2>
+        {pipelineApplicants.length === 0 ? (
+          <p className="muted">No pending induction applications.</p>
         ) : (
-          <ul className="list-clean">
-            {myNotifs.map((n) => (
-              <li key={n.id} className="list-item-row">
-                <span>{n.message}</span>
-                <span className="muted">Unread/Recent</span>
-              </li>
-            ))}
-          </ul>
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Applicant</th>
+                <th>Batch / Branch</th>
+                <th>Stage</th>
+                {canManage && <th>Actions</th>}
+              </tr>
+            </thead>
+            <tbody>
+              {pipelineApplicants.map((m) => (
+                <tr key={m.id}>
+                  <td>
+                    <Link to={`/players/${m.userId}`} className="player-link">
+                      {m.userName}
+                    </Link>
+                  </td>
+                  <td>
+                    {m.userBatch} · {m.userBranch}
+                  </td>
+                  <td>
+                    <span className="status-tag">{m.status}</span>
+                  </td>
+                  {canManage && (
+                    <td style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                      {m.status === "APPLIED" && (
+                        <button
+                          type="button"
+                          className="action-btn"
+                          style={{ padding: "5px 10px", fontSize: 12 }}
+                          disabled={busyAction !== null}
+                          onClick={() =>
+                            handleStatusUpdate(m.id, "TRIAL_ATTENDED")
+                          }
+                        >
+                          Mark Trial Attended
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="action-btn"
+                        style={{ padding: "5px 10px", fontSize: 12 }}
+                        disabled={busyAction !== null}
+                        onClick={() => handleStatusUpdate(m.id, "INDUCTED")}
+                      >
+                        Induct
+                      </button>
+                      <button
+                        type="button"
+                        className="action-btn"
+                        style={{
+                          padding: "5px 10px",
+                          fontSize: 12,
+                          background: "#b91c1c",
+                          color: "#f4efe6",
+                        }}
+                        disabled={busyAction !== null}
+                        onClick={() => handleStatusUpdate(m.id, "REJECTED")}
+                      >
+                        Reject
+                      </button>
+                    </td>
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </table>
         )}
+      </section>
+
+      <section className="panel">
+        <h2 className="section-heading">
+          Inducted Roster ({inductedMembers.length})
+        </h2>
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>Player</th>
+              <th>Role</th>
+              <th>Batch</th>
+              <th>Branch</th>
+            </tr>
+          </thead>
+          <tbody>
+            {inductedMembers.map((m) => (
+              <tr key={m.id}>
+                <td>
+                  <Link to={`/players/${m.userId}`} className="player-link">
+                    {m.userName}
+                  </Link>
+                </td>
+                <td>
+                  {m.memberRole}
+                  {m.memberRole === "COORDINATOR" ? ` (${m.batchScope})` : ""}
+                </td>
+                <td>{m.userBatch}</td>
+                <td>{m.userBranch}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </section>
     </div>
   );
