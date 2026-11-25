@@ -8,6 +8,7 @@ import CurrentTournamentPage from "./pages/CurrentTournamentPage";
 import LiveOrUpcomingPage from "./pages/LiveOrUpcomingPage";
 import AuctionPage from "./pages/AuctionPage";
 import LiveAuctionPage from "./pages/LiveAuctionPage";
+import LiveScorerPage from "./pages/LiveScorerPage";
 
 export interface DemoUser {
   id: number;
@@ -121,6 +122,8 @@ export default function App() {
           {auctionPlanned && <Link to="/auction">Auction</Link>}
           {liveAuctionActive && <Link to="/live-auction">Live Auction</Link>}
 
+          <Link to="/scorer">Match Scorer</Link>
+
           <Link to={hasLive ? "/live" : "/upcoming"}>
             {hasLive ? "Live" : "Upcoming"}
           </Link>
@@ -205,6 +208,15 @@ export default function App() {
               currentUser={currentUser}
               projectorModeRoute={true}
               onNavigate={(route) => navigate(route)}
+            />
+          }
+        />
+        <Route
+          path="/scorer"
+          element={
+            <LiveScorerPage
+              currentUser={currentUser}
+              onLiveStateChange={refreshBootstrap}
             />
           }
         />

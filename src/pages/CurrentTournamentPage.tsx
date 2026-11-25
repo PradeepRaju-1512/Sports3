@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import type { DemoUser } from "../App";
 
 interface TournamentDetail {
@@ -47,6 +48,7 @@ export default function CurrentTournamentPage({
   currentUser: DemoUser | null;
   onLiveStateChange: () => void;
 }) {
+  const navigate = useNavigate();
   const [tournament, setTournament] = useState<TournamentDetail | null>(null);
   const [teams, setTeams] = useState<TeamStanding[]>([]);
   const [matches, setMatches] = useState<MatchItem[]>([]);
@@ -290,6 +292,19 @@ export default function CurrentTournamentPage({
                   {liveMatch.resultSummary} · {liveMatch.venue}
                 </div>
               </div>
+              <button
+                type="button"
+                className="action-btn"
+                onClick={() => {
+                  const sportSlug = liveMatch.sportName
+                    .trim()
+                    .toLowerCase()
+                    .replace(/[\s-]+/g, "_");
+                  navigate(`/scorer?sport=${encodeURIComponent(sportSlug)}&matchId=${liveMatch.id}`);
+                }}
+              >
+                Launch Event Scorer
+              </button>
             </div>
 
             {isScorer && (
