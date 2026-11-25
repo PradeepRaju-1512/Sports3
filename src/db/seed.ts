@@ -3,6 +3,7 @@ import { count } from "drizzle-orm";
 import { db, pool } from "./index.js";
 import {
   users,
+  siteSettings,
   notices,
   sportsClubs,
   clubMemberships,
@@ -17,7 +18,9 @@ import {
   auctionRounds,
   auctionFranchises,
   auctionRegistrations,
+  auctionOperators,
 } from "./schema.js";
+import { hashPassword } from "../server/auth.js";
 
 const NINE_CLUBS = [
   {
@@ -198,12 +201,26 @@ async function seed() {
     },
   ];
 
+  const seedPassword = process.env.SEED_USER_PASSWORD?.trim();
+  const seededPasswordHash = seedPassword
+    ? await hashPassword(seedPassword)
+    : null;
+
   for (const u of sampleUsers) {
     await db
       .insert(users)
-      .values(u)
+      .values({ ...u, passwordHash: seededPasswordHash })
       .onConflictDoNothing({ target: users.email });
   }
+
+  await db
+    .insert(siteSettings)
+    .values({
+      id: 1,
+      showAuctionInNav: true,
+      showLiveAuctionInNav: false,
+    })
+    .onConflictDoNothing({ target: siteSettings.id });
 
   for (const club of NINE_CLUBS) {
     await db
@@ -1334,6 +1351,18 @@ async function seed() {
     if (rows.length > 0) {
       await db.insert(auctionRegistrations).values(rows);
     }
+  }
+
+  const vikramUser = allUsers.find((u) => u.email === "vikram.22@iiitt.ac.in");
+  if (vikramUser) {
+    await db
+      .insert(auctionOperators)
+      .values({
+        auctionId: seededAuctionId,
+        userId: vikramUser.id,
+        assignedByUserId: karthikUser?.id || null,
+      })
+      .onConflictDoNothing();
   }
 
   console.log("Seed completed successfully.");

@@ -1,4 +1,4 @@
-// In-memory session Bearer token store (never persisted to localStorage)
+// In-memory session Bearer token mirror (HttpOnly cookie is primary persistent store)
 let sessionToken: string | null = null;
 
 export function setAuthToken(token: string | null) {
@@ -17,7 +17,11 @@ export async function apiFetch(
   if (sessionToken && !headers.has("Authorization")) {
     headers.set("Authorization", `Bearer ${sessionToken}`);
   }
+  if (!headers.has("X-Requested-With")) {
+    headers.set("X-Requested-With", "fetch");
+  }
   return fetch(input, {
+    credentials: "same-origin",
     ...init,
     headers,
   });

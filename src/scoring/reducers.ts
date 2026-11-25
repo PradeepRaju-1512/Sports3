@@ -15,7 +15,7 @@ import type {
   SportId,
   TableTennisEvent,
   VolleyballEvent,
-} from "./types";
+} from "./types.js";
 
 // ============================================================================
 // DERIVED STATE INTERFACES FOR ALL 9 SPORTS

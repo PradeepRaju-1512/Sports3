@@ -60,9 +60,9 @@ export interface AuctionConfig {
 export interface AuctionRegistration {
   id: number;
   auctionId: number;
-  userId: number;
+  userId?: number;
   playerName: string;
-  rollNumber: string;
+  rollNumber?: string;
   yearLabel: string;
   branch: string;
   sport: string;

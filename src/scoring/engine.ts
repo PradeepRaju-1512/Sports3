@@ -6,7 +6,7 @@ import type {
   SportEvent,
   SportId,
   ViewportMode,
-} from "./types";
+} from "./types.js";
 
 /**
  * Pure deterministic event fold.

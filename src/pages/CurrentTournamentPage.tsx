@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import type { DemoUser } from "../App";
 import { apiFetch, formatLocalDateTime, toDateTimeLocalValue } from "../lib/api";
+import { useLiveMatchesStream } from "../hooks/useLiveMatchesStream";
 
 interface RosterMember {
   id: number;
@@ -103,7 +104,9 @@ export default function CurrentTournamentPage({
 
   const load = useCallback(async () => {
     try {
-      const res = await fetch("/api/tournaments/current", { cache: "no-store" });
+      const res = await apiFetch("/api/tournaments/current", {
+        cache: "no-store",
+      });
       if (!res.ok) {
         setErrorMsg("Unable to load current tournament.");
         return;
@@ -122,18 +125,14 @@ export default function CurrentTournamentPage({
 
   useEffect(() => {
     void load();
-    const id = window.setInterval(() => {
+  }, [load, currentUser?.id]);
+
+  // Real-time SSE updates when any match goes live, updates score, completes, or reopens
+  useLiveMatchesStream({
+    onMatchUpdate: () => {
       void load();
-    }, 15_000);
-    const onVis = () => {
-      if (document.visibilityState === "visible") void load();
-    };
-    document.addEventListener("visibilitychange", onVis);
-    return () => {
-      window.clearInterval(id);
-      document.removeEventListener("visibilitychange", onVis);
-    };
-  }, [load]);
+    },
+  });
 
   const isAdmin = Boolean(
     currentUser &&
@@ -206,6 +205,29 @@ export default function CurrentTournamentPage({
       onLiveStateChange();
     } catch {
       setErrorMsg("Network error starting match.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleReopenMatch(matchId: number) {
+    setBusy(`reopen-${matchId}`);
+    setFeedback(null);
+    setErrorMsg(null);
+    try {
+      const res = await apiFetch(`/api/matches/${matchId}/reopen`, {
+        method: "POST",
+      });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setErrorMsg(out.error || "Unable to reopen match.");
+        return;
+      }
+      setFeedback("Match reopened to LIVE and points table recalculated.");
+      await load();
+      onLiveStateChange();
+    } catch {
+      setErrorMsg("Network error reopening match.");
     } finally {
       setBusy(null);
     }
@@ -594,7 +616,8 @@ export default function CurrentTournamentPage({
         </section>
       )}
 
-      {/* CAPTAIN TEAM-LIST SUBMISSIONS */}
+      {/* CAPTAIN TEAM-LIST SUBMISSIONS (ONLY SHOWN TO CAPTAINS & AUTHORIZED OFFICIALS) */}
+      {(canCreateSubmission || submissions.length > 0) && (
       <section className="panel">
         <h2 className="section-heading">
           Captain Team-List Submissions ({submissions.length})
@@ -829,6 +852,7 @@ export default function CurrentTournamentPage({
           </div>
         )}
       </section>
+      )}
 
       {/* COMPLETED RESULTS */}
       <section className="panel">
@@ -841,14 +865,27 @@ export default function CurrentTournamentPage({
           <div style={{ display: "grid", gap: 10 }}>
             {completedMatches.map((m) => (
               <div key={m.id} className="notice-item">
-                <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 6 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
                   <strong>
                     {m.sportName} ({m.stage}): {m.teamA} {m.scoreA} vs {m.teamB}{" "}
                     {m.scoreB}
                   </strong>
-                  <span className="muted">
-                    {formatLocalDateTime(m.scheduledAt || m.scheduledTime)}
-                  </span>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <span className="muted">
+                      {formatLocalDateTime(m.scheduledAt || m.scheduledTime)}
+                    </span>
+                    {isAdmin && (
+                      <button
+                        type="button"
+                        className="operator-btn-secondary"
+                        style={{ padding: "4px 8px", fontSize: 11 }}
+                        disabled={busy !== null}
+                        onClick={() => handleReopenMatch(m.id)}
+                      >
+                        {busy === `reopen-${m.id}` ? "Reopening..." : "Reopen"}
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <div style={{ color: "#d4a038", marginTop: 4 }}>
                   {m.resultSummary}

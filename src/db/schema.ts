@@ -3,6 +3,7 @@ import {
   serial,
   text,
   integer,
+  bigint,
   boolean,
   timestamp,
   index,
@@ -28,6 +29,13 @@ export const notices = pgTable("notices", {
   category: text("category").notNull().default("GENERAL"),
   isUrgentBanner: boolean("is_urgent_banner").notNull().default(false),
   createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const siteSettings = pgTable("site_settings", {
+  id: integer("id").primaryKey().default(1),
+  showAuctionInNav: boolean("show_auction_in_nav").notNull().default(true),
+  showLiveAuctionInNav: boolean("show_live_auction_in_nav").notNull().default(true),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
 
 export const sportsClubs = pgTable("sports_clubs", {
@@ -217,6 +225,11 @@ export const tournamentMatches = pgTable(
     scoringStateJson: text("scoring_state_json"),
     lineupAJson: text("lineup_a_json"),
     lineupBJson: text("lineup_b_json"),
+    version: integer("version").notNull().default(1),
+    clockAnchorMs: bigint("clock_anchor_ms", { mode: "number" }),
+    clockAccumulatedMs: integer("clock_accumulated_ms").notNull().default(0),
+    clockRunning: boolean("clock_running").notNull().default(false),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
     scorerUserId: integer("scorer_user_id").references(() => users.id),
   },
   (table) => [
@@ -357,14 +370,53 @@ export const auctionBidEvents = pgTable(
   ]
 );
 
-export const playerPhotos = pgTable("player_photos", {
-  id: serial("id").primaryKey(),
-  publicKey: text("public_key").notNull().unique(),
-  uploadedByUserId: integer("uploaded_by_user_id").references(() => users.id, {
-    onDelete: "set null",
-  }),
-  mimeType: text("mime_type").notNull(),
-  dataBase64: text("data_base64").notNull(),
-  sizeBytes: integer("size_bytes").notNull(),
-  createdAt: timestamp("created_at").defaultNow().notNull(),
-});
+export const auctionOperators = pgTable(
+  "auction_operators",
+  {
+    id: serial("id").primaryKey(),
+    auctionId: integer("auction_id")
+      .notNull()
+      .references(() => auctions.id, { onDelete: "cascade" }),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    assignedByUserId: integer("assigned_by_user_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [
+    index("auction_operators_auction_idx").on(table.auctionId),
+    index("auction_operators_user_idx").on(table.userId),
+    uniqueIndex("auction_operators_unique").on(table.auctionId, table.userId),
+  ]
+);
+
+export const auctionIdempotencyKeys = pgTable(
+  "auction_idempotency_keys",
+  {
+    key: text("key").primaryKey(),
+    auctionId: integer("auction_id").notNull().default(1),
+    statusCode: integer("status_code").notNull().default(200),
+    responseJson: text("response_json").notNull(),
+    expiresAt: timestamp("expires_at").notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [index("auction_idempotency_expires_idx").on(table.expiresAt)]
+);
+
+export const playerPhotos = pgTable(
+  "player_photos",
+  {
+    id: serial("id").primaryKey(),
+    publicKey: text("public_key").notNull().unique(),
+    uploadedByUserId: integer("uploaded_by_user_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    mimeType: text("mime_type").notNull(),
+    dataBase64: text("data_base64").notNull(),
+    sizeBytes: integer("size_bytes").notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [index("player_photos_user_idx").on(table.uploadedByUserId)]
+);

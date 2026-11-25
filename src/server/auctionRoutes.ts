@@ -1,16 +1,19 @@
 import crypto from "crypto";
 import type { Express, Request, Response } from "express";
-import { and, asc, desc, eq } from "drizzle-orm";
+import { and, asc, desc, eq, lt } from "drizzle-orm";
 import { db } from "../db/index.js";
 import {
   auctionBidEvents,
   auctionFranchises,
+  auctionIdempotencyKeys,
+  auctionOperators,
   auctionRegistrations,
   auctionRounds,
   auctions,
   clubMemberships,
   playerPhotos,
   sportsClubs,
+  users,
 } from "../db/schema.js";
 import {
   auctionState,
@@ -20,6 +23,8 @@ import {
   DEFAULT_POSITIONS_BY_SPORT,
   demoStore,
   getEffectiveBasePrice,
+  sanitizeAuctionDeltaForViewer,
+  sanitizeAuctionSnapshotForViewer,
 } from "./demoStore.js";
 import { requireAuth, type AuthUserRecord } from "./auth.js";
 import {
@@ -39,6 +44,7 @@ export interface AuctionRouteDeps {
     dataUrl: string,
     uploadedByUserId: number
   ) => Promise<string | null>;
+  broadcastNavUpdate?: () => Promise<void>;
 }
 
 const VALID_AUCTION_STATUSES: AuctionStatus[] = [
@@ -50,15 +56,7 @@ const VALID_AUCTION_STATUSES: AuctionStatus[] = [
   "PUBLISHED",
 ];
 
-// Bounded idempotency cache (last 500 keys)
-const idempotencyCache = new Map<string, { status: number; body: unknown }>();
-function recordIdempotency(key: string, status: number, body: unknown) {
-  if (idempotencyCache.size >= 500) {
-    const oldest = idempotencyCache.keys().next().value;
-    if (oldest) idempotencyCache.delete(oldest);
-  }
-  idempotencyCache.set(key, { status, body });
-}
+const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 function getIdempotencyKey(req: Request): string | null {
   const hdr = req.headers["x-idempotency-key"];
@@ -80,15 +78,6 @@ function isAuctionAdmin(actor: AuthUserRecord | null | undefined): boolean {
   return Boolean(
     actor &&
       (actor.role === "SPORTS_SECRETARY" || actor.role === "FACULTY_ADVISOR")
-  );
-}
-
-function isAuctionOperator(actor: AuthUserRecord | null | undefined): boolean {
-  return Boolean(
-    actor &&
-      (actor.role === "AUCTION_OPERATOR" ||
-        actor.role === "SPORTS_SECRETARY" ||
-        actor.role === "FACULTY_ADVISOR")
   );
 }
 
@@ -144,6 +133,19 @@ export async function hydrateAuctionFromDb(useDb: () => boolean) {
       ? cfgRow.registrationDeadlineAt.toISOString()
       : cfgRow.registrationDeadline || "";
 
+    const activeRoundFallback =
+      roundRows.find((r) => r.id === cfgRow.activeRoundId)?.id ??
+      roundRows.find((r) => r.status === "ACTIVE")?.id ??
+      roundRows[0]?.id ??
+      1;
+    const activePlayerFallback =
+      regRows.find((r) => r.id === cfgRow.currentPlayerId)?.id ??
+      regRows.find((r) => r.status === "IN_AUCTION")?.id ??
+      null;
+    const activePlayerRow = activePlayerFallback
+      ? regRows.find((r) => r.id === activePlayerFallback)
+      : null;
+
     auctionState.auction = {
       id: cfgRow.id,
       name: cfgRow.name,
@@ -172,9 +174,13 @@ export async function hydrateAuctionFromDb(useDb: () => boolean) {
       positionsBySport: safeJsonParse(cfgRow.positionsBySportJson, {
         ...DEFAULT_POSITIONS_BY_SPORT,
       }),
-      activeRoundId: cfgRow.activeRoundId ?? (roundRows[0]?.id || 1),
-      activeSport: cfgRow.activeSport || parsedSports[0] || "Cricket",
-      currentPlayerId: cfgRow.currentPlayerId ?? null,
+      activeRoundId: activeRoundFallback,
+      activeSport:
+        cfgRow.activeSport ||
+        activePlayerRow?.sport ||
+        parsedSports[0] ||
+        "Cricket",
+      currentPlayerId: activePlayerFallback,
       projectorMode:
         (cfgRow.projectorMode as
           | "STAGE"
@@ -258,7 +264,106 @@ export async function hydrateAuctionFromDb(useDb: () => boolean) {
 }
 
 export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
-  const { useDb, sseClients, persistPhotoFromDataUrl } = deps;
+  const { useDb, sseClients, persistPhotoFromDataUrl, broadcastNavUpdate } = deps;
+  const sseClientPrivileged = new WeakMap<Response, boolean>();
+
+  // Event-scoped AUCTION_OPERATOR check (admins override; operators must be assigned to this auctionId)
+  async function isAssignedAuctionOperator(
+    actor: AuthUserRecord | null | undefined,
+    auctionId = auctionState.auction.id
+  ): Promise<boolean> {
+    if (!actor) return false;
+    if (isAuctionAdmin(actor)) return true;
+    if (useDb() && db) {
+      const [row] = await db
+        .select({ id: auctionOperators.id })
+        .from(auctionOperators)
+        .where(
+          and(
+            eq(auctionOperators.auctionId, auctionId),
+            eq(auctionOperators.userId, actor.id)
+          )
+        );
+      return Boolean(row);
+    }
+    return demoStore.auctionOperators.some(
+      (op) => op.auctionId === auctionId && op.userId === actor.id
+    );
+  }
+
+  // Persisted idempotency key lookup & recording (PostgreSQL table with expiry, or demoStore fallback)
+  async function lookupIdempotency(
+    key: string
+  ): Promise<{ status: number; body: unknown } | null> {
+    const now = Date.now();
+    if (useDb() && db) {
+      const [row] = await db
+        .select()
+        .from(auctionIdempotencyKeys)
+        .where(eq(auctionIdempotencyKeys.key, key));
+      if (!row) return null;
+      if (row.expiresAt.getTime() <= now) {
+        await db
+          .delete(auctionIdempotencyKeys)
+          .where(eq(auctionIdempotencyKeys.key, key))
+          .catch(() => {});
+        return null;
+      }
+      return {
+        status: row.statusCode,
+        body: safeJsonParse(row.responseJson, {}),
+      };
+    }
+    const cached = demoStore.auctionIdempotencyKeys.get(key);
+    if (!cached) return null;
+    if (cached.expiresAt <= now) {
+      demoStore.auctionIdempotencyKeys.delete(key);
+      return null;
+    }
+    return { status: cached.statusCode, body: cached.body };
+  }
+
+  async function recordIdempotency(
+    key: string,
+    statusCode: number,
+    body: unknown
+  ): Promise<void> {
+    const expiresAt = new Date(Date.now() + IDEMPOTENCY_TTL_MS);
+    if (useDb() && db) {
+      try {
+        await db
+          .insert(auctionIdempotencyKeys)
+          .values({
+            key,
+            auctionId: auctionState.auction.id,
+            statusCode,
+            responseJson: JSON.stringify(body),
+            expiresAt,
+          })
+          .onConflictDoNothing();
+        // Opportunistic expired-key cleanup
+        await db
+          .delete(auctionIdempotencyKeys)
+          .where(lt(auctionIdempotencyKeys.expiresAt, new Date()));
+      } catch {
+        // non-fatal
+      }
+      return;
+    }
+    if (demoStore.auctionIdempotencyKeys.size >= 1000) {
+      const now = Date.now();
+      for (const [k, v] of demoStore.auctionIdempotencyKeys.entries()) {
+        if (v.expiresAt <= now || demoStore.auctionIdempotencyKeys.size >= 1000) {
+          demoStore.auctionIdempotencyKeys.delete(k);
+        }
+      }
+    }
+    demoStore.auctionIdempotencyKeys.set(key, {
+      statusCode,
+      body,
+      expiresAt: expiresAt.getTime(),
+    });
+  }
 
   function broadcastDelta(opts?: {
     updatedRegistration?: AuctionRegistration | null;
@@ -266,11 +371,18 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
     latestBidEvent?: BidEvent | null;
     includeRounds?: boolean;
   }) {
-    const delta = buildLiveAuctionDelta(opts);
-    const payload = `event: delta\ndata: ${JSON.stringify(delta)}\n\n`;
+    const rawDelta = buildLiveAuctionDelta(opts);
+    const publicPayload = `event: delta\ndata: ${JSON.stringify(
+      sanitizeAuctionDeltaForViewer(rawDelta, false)
+    )}\n\n`;
+    const privilegedPayload = `event: delta\ndata: ${JSON.stringify(
+      sanitizeAuctionDeltaForViewer(rawDelta, true)
+    )}\n\n`;
+
     for (const client of sseClients) {
       try {
-        client.write(payload);
+        const isPriv = sseClientPrivileged.get(client) === true;
+        client.write(isPriv ? privilegedPayload : publicPayload);
       } catch {
         sseClients.delete(client);
       }
@@ -278,22 +390,49 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
   }
 
   function broadcastFullSnapshot() {
-    const snap = buildLiveAuctionSnapshot();
-    const payload = `event: snapshot\ndata: ${JSON.stringify(snap)}\n\n`;
+    const rawSnap = buildLiveAuctionSnapshot();
+    const publicPayload = `event: snapshot\ndata: ${JSON.stringify(
+      sanitizeAuctionSnapshotForViewer(rawSnap, false)
+    )}\n\n`;
+    const privilegedPayload = `event: snapshot\ndata: ${JSON.stringify(
+      sanitizeAuctionSnapshotForViewer(rawSnap, true)
+    )}\n\n`;
+
     for (const client of sseClients) {
       try {
-        client.write(payload);
+        const isPriv = sseClientPrivileged.get(client) === true;
+        client.write(isPriv ? privilegedPayload : publicPayload);
       } catch {
         sseClients.delete(client);
       }
     }
   }
 
-  function checkExpectedVersion(req: Request, res: Response): boolean {
+  function checkExpectedVersion(
+    req: Request,
+    res: Response,
+    required = true
+  ): boolean {
     const raw = req.body?.expectedVersion;
-    if (raw === undefined || raw === null || raw === "") return true;
+    if (raw === undefined || raw === null || raw === "") {
+      if (required) {
+        res.status(400).json({
+          error: "expectedVersion is required for auction state mutations",
+          currentVersion: auctionState.auction.version,
+        });
+        return false;
+      }
+      return true;
+    }
     const expected = Number(raw);
-    if (Number.isFinite(expected) && expected !== auctionState.auction.version) {
+    if (!Number.isInteger(expected)) {
+      res.status(400).json({
+        error: "expectedVersion must be an integer",
+        currentVersion: auctionState.auction.version,
+      });
+      return false;
+    }
+    if (expected !== auctionState.auction.version) {
       res.status(409).json({
         error: "Auction state was updated by another operator. Please retry.",
         currentVersion: auctionState.auction.version,
@@ -306,9 +445,15 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
   // GET /api/auction (registration & management overview, derives inductedSports from verified session)
   app.get("/api/auction", async (req, res) => {
     try {
-      const snap = buildLiveAuctionSnapshot();
+      const actor = req.authUser || null;
+      const isPriv = await isAssignedAuctionOperator(actor);
+      const snap = sanitizeAuctionSnapshotForViewer(
+        buildLiveAuctionSnapshot(),
+        isPriv,
+        actor?.id ?? null
+      );
       let inductedSports: string[] = [];
-      const actorId = req.authUser?.id ?? null;
+      const actorId = actor?.id ?? null;
 
       if (actorId) {
         if (useDb() && db) {
@@ -338,26 +483,43 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
       res.json({
         ...snap,
         inductedSports,
+        canOperateAuction: isPriv,
       });
     } catch (err) {
       sendServerError(res, "GET /api/auction", err);
     }
   });
 
-  // GET live snapshot
-  app.get("/api/auction/live-state", (_req, res) => {
-    res.json(buildLiveAuctionSnapshot());
+  // GET live snapshot — strips rollNumber and userId for public/spectator callers
+  app.get("/api/auction/live-state", async (req, res) => {
+    try {
+      const isPriv = await isAssignedAuctionOperator(req.authUser);
+      const snap = sanitizeAuctionSnapshotForViewer(
+        buildLiveAuctionSnapshot(),
+        isPriv,
+        req.authUser?.id ?? null
+      );
+      res.json({ ...snap, canOperateAuction: isPriv });
+    } catch (err) {
+      sendServerError(res, "GET /api/auction/live-state", err);
+    }
   });
 
-  // SSE stream: sends full snapshot on connect, then compact deltas on mutations
-  app.get("/api/auction/stream", (req, res) => {
+  // SSE stream: sends sanitized snapshot on connect, then compact deltas on mutations
+  app.get("/api/auction/stream", async (req, res) => {
+    const isPriv = await isAssignedAuctionOperator(req.authUser);
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
     res.setHeader("X-Accel-Buffering", "no");
     res.flushHeaders?.();
 
-    const snap = buildLiveAuctionSnapshot();
+    const snap = sanitizeAuctionSnapshotForViewer(
+      buildLiveAuctionSnapshot(),
+      isPriv,
+      req.authUser?.id ?? null
+    );
+    sseClientPrivileged.set(res, isPriv);
     res.write(`event: snapshot\ndata: ${JSON.stringify(snap)}\n\n`);
     sseClients.add(res);
 
@@ -404,10 +566,10 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
             "Only Sports Secretary or Faculty Advisor can modify auction rules and base prices",
         });
       }
-      if (!isAuctionOperator(actor)) {
+      if (!(await isAssignedAuctionOperator(actor))) {
         return res.status(403).json({
           error:
-            "Only Auction Operator, Sports Secretary, or Faculty Advisor can update auction configuration",
+            "Only an assigned Auction Operator, Sports Secretary, or Faculty Advisor can update auction configuration",
         });
       }
 
@@ -646,6 +808,7 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
       auctionState.auction.version = nextVersion;
       auctionState.auction.lastUpdatedAt = nowIso;
       broadcastDelta();
+      if (broadcastNavUpdate) await broadcastNavUpdate();
       res.json({
         ...buildLiveAuctionSnapshot(),
         message: `Auction status changed to ${nextStatus}`,
@@ -658,8 +821,8 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
   // POST /api/auction/round (switch active round)
   app.post("/api/auction/round", requireAuth, async (req, res) => {
     try {
-      if (!isAuctionOperator(req.authUser)) {
-        return res.status(403).json({ error: "Operator permission required" });
+      if (!(await isAssignedAuctionOperator(req.authUser))) {
+        return res.status(403).json({ error: "Assigned Auction Operator permission required" });
       }
       const roundId = Number(req.body?.roundId);
       const target = auctionState.rounds.find((r) => r.id === roundId);
@@ -702,10 +865,10 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
   // POST /api/auction/context (switch activeSport, activeRoundId, or pull specific currentPlayerId)
   app.post("/api/auction/context", requireAuth, async (req, res) => {
     try {
-      if (!isAuctionOperator(req.authUser)) {
-        return res.status(403).json({ error: "Operator permission required" });
+      if (!(await isAssignedAuctionOperator(req.authUser))) {
+        return res.status(403).json({ error: "Assigned Auction Operator permission required" });
       }
-      if (!checkExpectedVersion(req, res)) return;
+      if (!checkExpectedVersion(req, res, false)) return;
 
       const body = req.body || {};
       let nextSport = auctionState.auction.activeSport;
@@ -804,8 +967,8 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
   // POST /api/auction/projector (toggle projector display mode)
   app.post("/api/auction/projector", requireAuth, async (req, res) => {
     try {
-      if (!isAuctionOperator(req.authUser)) {
-        return res.status(403).json({ error: "Operator permission required" });
+      if (!(await isAssignedAuctionOperator(req.authUser))) {
+        return res.status(403).json({ error: "Assigned Auction Operator permission required" });
       }
       const mode = String(req.body?.mode || "STAGE").toUpperCase();
       if (!["STAGE", "SOLD", "UNSOLD", "STANDINGS", "PAUSED"].includes(mode)) {
@@ -848,10 +1011,10 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
   // POST /api/auction/rtm (Right-to-Match marker on current player)
   app.post("/api/auction/rtm", requireAuth, async (req, res) => {
     try {
-      if (!isAuctionOperator(req.authUser)) {
-        return res.status(403).json({ error: "Operator permission required" });
+      if (!(await isAssignedAuctionOperator(req.authUser))) {
+        return res.status(403).json({ error: "Assigned Auction Operator permission required" });
       }
-      if (!checkExpectedVersion(req, res)) return;
+      if (!checkExpectedVersion(req, res, true)) return;
       const player = auctionState.registrations.find(
         (r) => r.id === auctionState.auction.currentPlayerId
       );
@@ -919,7 +1082,7 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
   // POST /api/auction/rounds
   app.post("/api/auction/rounds", requireAuth, async (req, res) => {
     try {
-      if (!isAuctionOperator(req.authUser)) {
+      if (!(await isAssignedAuctionOperator(req.authUser))) {
         return res.status(403).json({ error: "Not authorized to manage rounds" });
       }
       const name = String(req.body?.name || "").trim();
@@ -975,7 +1138,7 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
   // PATCH /api/auction/rounds/:id (edit round or move UNSOLD players into this round)
   app.patch("/api/auction/rounds/:id", requireAuth, async (req, res) => {
     try {
-      if (!isAuctionOperator(req.authUser)) {
+      if (!(await isAssignedAuctionOperator(req.authUser))) {
         return res.status(403).json({ error: "Not authorized to update rounds" });
       }
       const id = Number(req.params.id);
@@ -1381,19 +1544,35 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
         }
       }
 
+      // Derive student identity strictly from the authenticated DB user record
       const targetUserId =
         isAuctionAdmin(actor) && body.userId ? Number(body.userId) : actor.id;
+      let targetUser: AuthUserRecord | null = actor;
+      if (targetUserId !== actor.id) {
+        if (useDb() && db) {
+          const [u] = await db
+            .select()
+            .from(users)
+            .where(eq(users.id, targetUserId));
+          targetUser = u || null;
+        } else {
+          targetUser =
+            demoStore.users.find((u) => u.id === targetUserId) || null;
+        }
+        if (!targetUser) {
+          return res.status(404).json({ error: "Target user not found" });
+        }
+      }
+
       const sport = String(body.sport || "").trim();
       const positions: string[] = Array.isArray(body.positions)
         ? body.positions.map((p: unknown) => String(p).trim()).filter(Boolean)
         : [];
-      const playerName = String(body.playerName || actor.name).trim();
-      const rollNumber = String(
-        body.rollNumber || actor.rollNumber || "IIITT"
-      ).trim();
-      const yearLabel = String(body.yearLabel || actor.batch || "3rd Year").trim();
-      const branch = String(body.branch || actor.branch || "CSE").trim();
-      const statsSummary = String(body.statsSummary || "").trim();
+      const playerName = targetUser.name.trim();
+      const rollNumber = (targetUser.rollNumber || "IIITT").trim();
+      const yearLabel = (targetUser.batch || "3RD").trim();
+      const branch = (targetUser.branch || "CSE").trim();
+      const statsSummary = String(body.statsSummary || "").trim().slice(0, 400);
 
       if (!sport) {
         return res.status(400).json({ error: "Sport is required" });
@@ -1579,7 +1758,7 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
       if (!reg) return res.status(404).json({ error: "Registration not found" });
 
       const isSelf = reg.userId === actor.id;
-      const isOp = isAuctionOperator(actor);
+      const isOp = await isAssignedAuctionOperator(actor);
       if (!isOp && !isSelf) {
         return res
           .status(403)
@@ -1589,10 +1768,11 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
       const body = req.body || {};
       const updated = { ...reg };
 
-      if (typeof body.playerName === "string" && body.playerName.trim()) {
+      // Only admins/operators can edit identity fields; students cannot spoof name/rollNumber
+      if (isOp && typeof body.playerName === "string" && body.playerName.trim()) {
         updated.playerName = body.playerName.trim();
       }
-      if (typeof body.rollNumber === "string" && body.rollNumber.trim()) {
+      if (isOp && typeof body.rollNumber === "string" && body.rollNumber.trim()) {
         updated.rollNumber = body.rollNumber.trim();
       }
       if (typeof body.yearLabel === "string" && body.yearLabel.trim()) {
@@ -1745,10 +1925,10 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
   // POST /api/auction/nominate (bring specific player onto stage)
   app.post("/api/auction/nominate", requireAuth, async (req, res) => {
     try {
-      if (!isAuctionOperator(req.authUser)) {
-        return res.status(403).json({ error: "Operator permission required" });
+      if (!(await isAssignedAuctionOperator(req.authUser))) {
+        return res.status(403).json({ error: "Assigned Auction Operator permission required" });
       }
-      if (!checkExpectedVersion(req, res)) return;
+      if (!checkExpectedVersion(req, res, true)) return;
 
       const playerId = Number(req.body?.playerId);
       const player = auctionState.registrations.find((r) => r.id === playerId);
@@ -1810,17 +1990,19 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
   // POST /api/auction/bid (strict server-side rules + DB transaction first + idempotency + version check)
   app.post("/api/auction/bid", requireAuth, async (req, res) => {
     try {
-      if (!isAuctionOperator(req.authUser)) {
-        return res.status(403).json({ error: "Operator permission required" });
+      if (!(await isAssignedAuctionOperator(req.authUser))) {
+        return res.status(403).json({ error: "Assigned Auction Operator permission required" });
       }
 
       const idempKey = getIdempotencyKey(req);
-      if (idempKey && idempotencyCache.has(idempKey)) {
-        const cached = idempotencyCache.get(idempKey)!;
-        return res.status(cached.status).json(cached.body);
+      if (idempKey) {
+        const cached = await lookupIdempotency(idempKey);
+        if (cached) {
+          return res.status(cached.status).json(cached.body);
+        }
       }
 
-      if (!checkExpectedVersion(req, res)) return;
+      if (!checkExpectedVersion(req, res, true)) return;
 
       const franchiseId = Number(req.body?.franchiseId);
       const rawCustom = req.body?.customAmount ?? req.body?.amount;
@@ -1954,7 +2136,7 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
 
       broadcastDelta({ updatedRegistration: player, latestBidEvent: bidEvent });
       const snap = buildLiveAuctionSnapshot();
-      if (idempKey) recordIdempotency(idempKey, 200, snap);
+      if (idempKey) await recordIdempotency(idempKey, 200, snap);
       res.json(snap);
     } catch (err) {
       sendServerError(res, "POST /api/auction/bid", err);
@@ -1964,16 +2146,18 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
   // POST /api/auction/outcome (SOLD or UNSOLD — DB transaction first!)
   app.post("/api/auction/outcome", requireAuth, async (req, res) => {
     try {
-      if (!isAuctionOperator(req.authUser)) {
-        return res.status(403).json({ error: "Operator permission required" });
+      if (!(await isAssignedAuctionOperator(req.authUser))) {
+        return res.status(403).json({ error: "Assigned Auction Operator permission required" });
       }
 
       const idempKey = getIdempotencyKey(req);
-      if (idempKey && idempotencyCache.has(idempKey)) {
-        const cached = idempotencyCache.get(idempKey)!;
-        return res.status(cached.status).json(cached.body);
+      if (idempKey) {
+        const cached = await lookupIdempotency(idempKey);
+        if (cached) {
+          return res.status(cached.status).json(cached.body);
+        }
       }
-      if (!checkExpectedVersion(req, res)) return;
+      if (!checkExpectedVersion(req, res, true)) return;
 
       const outcome = String(req.body?.outcome || "").toUpperCase();
       if (outcome !== "SOLD" && outcome !== "UNSOLD") {
@@ -2082,7 +2266,7 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
 
         broadcastDelta({ updatedRegistration: player, latestBidEvent: soldEvent });
         const snap = buildLiveAuctionSnapshot();
-        if (idempKey) recordIdempotency(idempKey, 200, snap);
+        if (idempKey) await recordIdempotency(idempKey, 200, snap);
         return res.json(snap);
       }
 
@@ -2145,7 +2329,7 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
 
       broadcastDelta({ updatedRegistration: player, latestBidEvent: unsoldEvent });
       const snap = buildLiveAuctionSnapshot();
-      if (idempKey) recordIdempotency(idempKey, 200, snap);
+      if (idempKey) await recordIdempotency(idempKey, 200, snap);
       res.json(snap);
     } catch (err) {
       sendServerError(res, "POST /api/auction/outcome", err);
@@ -2155,10 +2339,10 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
   // POST /api/auction/undo (DB-first undo of last bid or last outcome)
   app.post("/api/auction/undo", requireAuth, async (req, res) => {
     try {
-      if (!isAuctionOperator(req.authUser)) {
-        return res.status(403).json({ error: "Operator permission required" });
+      if (!(await isAssignedAuctionOperator(req.authUser))) {
+        return res.status(403).json({ error: "Assigned Auction Operator permission required" });
       }
-      if (!checkExpectedVersion(req, res)) return;
+      if (!checkExpectedVersion(req, res, true)) return;
 
       const lastEvent = auctionState.bidHistory[0];
       if (!lastEvent) {
@@ -2230,10 +2414,10 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
   // POST /api/auction/next & /api/auction/next-player (advance to next eligible player)
   const handleAdvanceNextPlayer = async (req: Request, res: Response) => {
     try {
-      if (!isAuctionOperator(req.authUser)) {
-        return res.status(403).json({ error: "Operator permission required" });
+      if (!(await isAssignedAuctionOperator(req.authUser))) {
+        return res.status(403).json({ error: "Assigned Auction Operator permission required" });
       }
-      if (!checkExpectedVersion(req, res)) return;
+      if (!checkExpectedVersion(req, res, true)) return;
 
       const sportFilter = String(
         req.body?.sport || auctionState.auction.activeSport || ""
@@ -2324,9 +2508,10 @@ export function registerAuctionRoutes(app: Express, deps: AuctionRouteDeps) {
   // POST /api/auction/requeue-unsold (move UNSOLD players in active sport to target round as RE_AUCTIONED)
   app.post("/api/auction/requeue-unsold", requireAuth, async (req, res) => {
     try {
-      if (!isAuctionOperator(req.authUser)) {
-        return res.status(403).json({ error: "Operator permission required" });
+      if (!(await isAssignedAuctionOperator(req.authUser))) {
+        return res.status(403).json({ error: "Assigned Auction Operator permission required" });
       }
+      if (!checkExpectedVersion(req, res, true)) return;
       const sport = String(req.body?.sport || auctionState.auction.activeSport).trim();
       const targetRoundId =
         Number(req.body?.roundId) ||

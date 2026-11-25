@@ -273,18 +273,27 @@ export default function ClubPage({
 
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             {canManage && scope === "ALL" && (
-              <button
-                type="button"
-                className="action-btn"
-                disabled={busyAction !== null}
-                onClick={handleToggleInduction}
-              >
-                {busyAction === "toggle-induction"
-                  ? "Updating..."
-                  : detail.club.inductionOpen
-                    ? "Close Inductions"
-                    : "Open Inductions"}
-              </button>
+              <>
+                <button
+                  type="button"
+                  className="action-btn"
+                  disabled={busyAction !== null}
+                  onClick={handleToggleInduction}
+                >
+                  {busyAction === "toggle-induction"
+                    ? "Updating..."
+                    : detail.club.inductionOpen
+                      ? "Close Inductions"
+                      : "Open Inductions"}
+                </button>
+                <Link
+                  to="/admin"
+                  className="operator-btn-secondary"
+                  style={{ textDecoration: "none", display: "inline-flex", alignItems: "center" }}
+                >
+                  Appoint Coordinators
+                </Link>
+              </>
             )}
             {currentUser && !myMembership && (
               <button
@@ -460,15 +469,17 @@ export default function ClubPage({
                           Mark Trial Attended
                         </button>
                       )}
-                      <button
-                        type="button"
-                        className="action-btn"
-                        style={{ padding: "5px 10px", fontSize: 12 }}
-                        disabled={busyAction !== null}
-                        onClick={() => handleStatusUpdate(m.id, "INDUCTED")}
-                      >
-                        Induct
-                      </button>
+                      {m.status === "TRIAL_ATTENDED" && (
+                        <button
+                          type="button"
+                          className="action-btn"
+                          style={{ padding: "5px 10px", fontSize: 12 }}
+                          disabled={busyAction !== null}
+                          onClick={() => handleStatusUpdate(m.id, "INDUCTED")}
+                        >
+                          Induct
+                        </button>
+                      )}
                       <button
                         type="button"
                         className="action-btn"

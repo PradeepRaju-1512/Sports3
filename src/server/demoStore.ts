@@ -152,7 +152,26 @@ export interface MatchRecord {
   scoringStateJson?: string | null;
   lineupAJson?: string | null;
   lineupBJson?: string | null;
+  version?: number;
+  clockAnchorMs?: number | null;
+  clockAccumulatedMs?: number;
+  clockRunning?: boolean;
+  updatedAt?: string;
   scorerUserId: number | null;
+}
+
+export interface SiteSettingsRecord {
+  showAuctionInNav: boolean;
+  showLiveAuctionInNav: boolean;
+  updatedAt: string;
+}
+
+export interface AuctionOperatorRecord {
+  id: number;
+  auctionId: number;
+  userId: number;
+  assignedByUserId: number | null;
+  createdAt: Date;
 }
 
 export interface PlayerPhotoRecord {
@@ -872,6 +891,27 @@ export const demoStore = {
       scorerUserId: 5,
     },
   ] as MatchRecord[],
+
+  siteSettings: {
+    showAuctionInNav: true,
+    showLiveAuctionInNav: true,
+    updatedAt: now.toISOString(),
+  } as SiteSettingsRecord,
+
+  auctionOperators: [
+    {
+      id: 1,
+      auctionId: 1,
+      userId: 6, // Vikram Rao assigned to Auction #1
+      assignedByUserId: 1,
+      createdAt: now,
+    },
+  ] as AuctionOperatorRecord[],
+
+  auctionIdempotencyKeys: new Map<
+    string,
+    { statusCode: number; body: unknown; expiresAt: number }
+  >(),
 };
 
 // Seed resource-scoped memberships & ISO-timestamped activities for all 9 clubs
@@ -1565,3 +1605,76 @@ export function buildLiveAuctionDelta(opts?: {
     serverTime: new Date().toISOString(),
   };
 }
+
+function safePublicPhotoUrl(url: string | null | undefined): string | null {
+  if (!url) return null;
+  // Never leak raw base64 blobs in live snapshots
+  if (url.startsWith("data:")) return null;
+  return url;
+}
+
+export function sanitizeRegistrationForViewer(
+  reg: AuctionRegistration,
+  isPrivileged: boolean,
+  selfUserId?: number | null
+): AuctionRegistration & { isSelf?: boolean } {
+  const safePhoto = safePublicPhotoUrl(reg.photoUrl);
+  const isSelf = Boolean(selfUserId && reg.userId === selfUserId);
+  if (isPrivileged) {
+    return { ...reg, photoUrl: safePhoto, ...(isSelf ? { isSelf: true } : {}) };
+  }
+  const { rollNumber: _r, userId: _u, ...rest } = reg;
+  return {
+    ...(rest as AuctionRegistration),
+    photoUrl: safePhoto,
+    ...(isSelf ? { isSelf: true } : {}),
+  };
+}
+
+export function sanitizeFranchisesForViewer(
+  franchises: FranchiseSummary[],
+  isPrivileged: boolean
+): FranchiseSummary[] {
+  return franchises.map((f) => ({
+    ...f,
+    purchasedPlayers: f.purchasedPlayers.map((p) => {
+      const safePhoto = safePublicPhotoUrl(p.photoUrl);
+      if (isPrivileged) return { ...p, photoUrl: safePhoto };
+      const { userId: _u, ...rest } = p;
+      return { ...rest, photoUrl: safePhoto };
+    }),
+  }));
+}
+
+export function sanitizeAuctionSnapshotForViewer(
+  snap: LiveAuctionSnapshot,
+  isPrivileged: boolean,
+  selfUserId?: number | null
+): LiveAuctionSnapshot {
+  return {
+    ...snap,
+    registrations: snap.registrations.map((r) =>
+      sanitizeRegistrationForViewer(r, isPrivileged, selfUserId)
+    ),
+    franchises: sanitizeFranchisesForViewer(snap.franchises, isPrivileged),
+  };
+}
+
+export function sanitizeAuctionDeltaForViewer(
+  delta: LiveAuctionDelta,
+  isPrivileged: boolean
+): LiveAuctionDelta {
+  return {
+    ...delta,
+    ...(delta.updatedRegistration
+      ? {
+          updatedRegistration: sanitizeRegistrationForViewer(
+            delta.updatedRegistration,
+            isPrivileged
+          ),
+        }
+      : {}),
+    franchises: sanitizeFranchisesForViewer(delta.franchises, isPrivileged),
+  };
+}
+

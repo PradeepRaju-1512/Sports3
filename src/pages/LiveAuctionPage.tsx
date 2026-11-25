@@ -106,22 +106,42 @@ export default function LiveAuctionPage({
     }
   }, [projectorModeRoute]);
 
+  const [assignedAuctionIds, setAssignedAuctionIds] = useState<number[]>([]);
+
+  useEffect(() => {
+    if (!currentUser) {
+      setAssignedAuctionIds([]);
+      return;
+    }
+    let cancelled = false;
+    apiFetch("/api/auth/me", { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (!cancelled && d && Array.isArray(d.auctionOperatorAuctionIds)) {
+          setAssignedAuctionIds(d.auctionOperatorAuctionIds);
+        }
+      })
+      .catch(() => {
+        // ignore
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentUser?.id]);
+
+  const auction = snapshot?.auction || null;
+
   const canOperate = Boolean(
     currentUser &&
-      [
-        "AUCTION_OPERATOR",
-        "AUCTIONEER",
-        "SPORTS_SECRETARY",
-        "FACULTY_ADVISOR",
-      ].includes(currentUser.role)
+      (["SPORTS_SECRETARY", "FACULTY_ADVISOR"].includes(currentUser.role) ||
+        (auction && assignedAuctionIds.includes(auction.id)))
   );
 
-  // Show Top-Right Operator Controls for authorized operators in console mode,
+  // Show Top-Right Operator Controls for authorized event operators in console mode,
   // and hide them for spectators and projector-only mode (unless operator explicitly toggles them on).
   const showOperatorPanel =
     canOperate && (!fullScreenProjector || showOperatorControlsInProjector);
 
-  const auction = snapshot?.auction || null;
   const rounds = snapshot?.rounds || [];
   const registrations = snapshot?.registrations || [];
   const allFranchises = snapshot?.franchises || [];
@@ -270,11 +290,12 @@ export default function LiveAuctionPage({
         const res = await apiFetch(endpoint, {
           method,
           headers: {
+            "Content-Type": "application/json",
             "X-Idempotency-Key": makeIdempotencyKey("auc"),
           },
           body: JSON.stringify({
             ...payload,
-            expectedVersion: auction?.version,
+            expectedVersion: snapshot?.version ?? auction?.version,
           }),
         });
         const json = await res.json().catch(() => ({}));
@@ -712,17 +733,22 @@ export default function LiveAuctionPage({
             <>
               <div>
                 <div className="player-roll-kicker tabular-nums">
-                  {activePlayer.rollNumber} · {activePlayer.sport} ·{" "}
+                  {activePlayer.rollNumber ? `${activePlayer.rollNumber} · ` : ""}
+                  {activePlayer.sport} ·{" "}
                   {activePlayer.status.replace("_", " ")}
                 </div>
                 <h1 className="player-stage-name">
-                  <Link
-                    to={`/players/${activePlayer.userId}`}
-                    className="player-link"
-                    style={{ color: "inherit" }}
-                  >
-                    {activePlayer.playerName}
-                  </Link>
+                  {activePlayer.userId ? (
+                    <Link
+                      to={`/players/${activePlayer.userId}`}
+                      className="player-link"
+                      style={{ color: "inherit" }}
+                    >
+                      {activePlayer.playerName}
+                    </Link>
+                  ) : (
+                    activePlayer.playerName
+                  )}
                 </h1>
                 <div className="player-bio-line">
                   <span>{activePlayer.yearLabel}</span>

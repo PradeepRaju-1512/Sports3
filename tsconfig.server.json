@@ -9,5 +9,12 @@
     "skipLibCheck": true,
     "esModuleInterop": true
   },
-  "include": ["src/server/**/*", "src/db/**/*", "src/types/**/*"]
+  "include": [
+    "src/server/**/*",
+    "src/db/**/*",
+    "src/types/**/*",
+    "src/scoring/types.ts",
+    "src/scoring/engine.ts",
+    "src/scoring/reducers.ts"
+  ]
 }

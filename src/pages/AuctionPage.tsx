@@ -610,7 +610,7 @@ export default function AuctionPage({
   function startEditRow(reg: AuctionRegistration) {
     setEditingId(reg.id);
     setEditPlayerName(reg.playerName);
-    setEditRollNumber(reg.rollNumber);
+    setEditRollNumber(reg.rollNumber || "");
     setEditYear(reg.yearLabel);
     setEditBranch(reg.branch);
     setEditPositions(reg.positions.join(", "));
@@ -652,7 +652,7 @@ export default function AuctionPage({
       if (!q) return true;
       return (
         r.playerName.toLowerCase().includes(q) ||
-        r.rollNumber.toLowerCase().includes(q) ||
+        (r.rollNumber || "").toLowerCase().includes(q) ||
         r.branch.toLowerCase().includes(q) ||
         r.yearLabel.toLowerCase().includes(q) ||
         r.positions.some((p) => p.toLowerCase().includes(q)) ||
@@ -1637,6 +1637,19 @@ export default function AuctionPage({
             one or more playing positions and your broadcast portrait photo. To
             enroll in another sport, submit a separate registration.
           </p>
+          {currentUser ? (
+            <div className="readonly-banner" style={{ marginTop: 10 }}>
+              Verified Student Identity (server-derived):{" "}
+              <strong>{currentUser.name}</strong>
+              {currentUser.rollNumber ? ` · ${currentUser.rollNumber}` : ""} ·{" "}
+              {currentUser.batch} · {currentUser.branch}
+            </div>
+          ) : (
+            <div className="readonly-banner" style={{ marginTop: 10 }}>
+              Please <Link to="/login" style={{ color: "#d4a038" }}>Sign In</Link>{" "}
+              with your institute account to register for the auction.
+            </div>
+          )}
 
           <form
             onSubmit={handleEnrollSport}
@@ -2041,15 +2054,19 @@ export default function AuctionPage({
                         name={reg.playerName}
                       />
                       <div>
-                        <Link
-                          to={`/players/${reg.userId}`}
-                          className="player-link"
-                        >
-                          {reg.playerName}
-                        </Link>{" "}
+                        {reg.userId ? (
+                          <Link
+                            to={`/players/${reg.userId}`}
+                            className="player-link"
+                          >
+                            {reg.playerName}
+                          </Link>
+                        ) : (
+                          <strong>{reg.playerName}</strong>
+                        )}{" "}
                         <span className="muted">
-                          · {reg.rollNumber} · {reg.yearLabel} · {reg.branch} ·{" "}
-                          {reg.sport}
+                          {reg.rollNumber ? `· ${reg.rollNumber} ` : ""}·{" "}
+                          {reg.yearLabel} · {reg.branch} · {reg.sport}
                         </span>
                         <div
                           style={{ fontSize: 13, marginTop: 2 }}

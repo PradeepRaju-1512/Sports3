@@ -1,46 +1,84 @@
 import type { Request, Response, NextFunction } from "express";
+import type { CorsOptionsDelegate } from "cors";
 
-export function buildCorsOptions() {
-  const rawOrigins = (process.env.CORS_ORIGIN || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+export function parseTrustProxySetting(): boolean | number | string {
+  const raw = process.env.TRUST_PROXY?.trim();
+  if (!raw) {
+    return process.env.NODE_ENV === "production" ? 1 : false;
+  }
+  if (raw === "false" || raw === "0") return false;
+  if (raw === "true") return true;
+  const asNum = Number(raw);
+  if (Number.isInteger(asNum) && asNum >= 0) return asNum;
+  return raw;
+}
 
-  return {
-    origin(
-      origin: string | undefined,
-      callback: (err: Error | null, allow?: boolean) => void
-    ) {
-      // Allow same-origin / server-to-server / curl requests without Origin header
-      if (!origin) {
-        callback(null, true);
+/**
+ * Explicit CORS policy — zero wildcard `.run.app` / `.googleusercontent.com` matching.
+ * Same-origin requests (matching Host / X-Forwarded-Host) and explicit `CORS_ORIGIN` entries are allowed.
+ * Localhost/127.0.0.1 is allowed only in non-production environments.
+ */
+export function buildCorsOptions(): CorsOptionsDelegate<Request> {
+  const explicitOrigins = new Set(
+    (process.env.CORS_ORIGIN || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+  );
+  const isProd = process.env.NODE_ENV === "production";
+
+  return (req, callback) => {
+    const origin = req.headers.origin;
+    const baseOpts = {
+      credentials: true,
+      methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+      allowedHeaders: [
+        "Content-Type",
+        "Authorization",
+        "X-Idempotency-Key",
+        "X-Requested-With",
+      ],
+    };
+
+    // Requests without Origin header (same-origin GET, curl, server-to-server)
+    if (!origin) {
+      callback(null, { ...baseOpts, origin: true });
+      return;
+    }
+
+    if (explicitOrigins.has(origin)) {
+      callback(null, { ...baseOpts, origin: true });
+      return;
+    }
+
+    try {
+      const parsed = new URL(origin);
+      const reqHost = String(
+        req.headers["x-forwarded-host"] || req.headers.host || ""
+      )
+        .split(",")[0]
+        .trim()
+        .toLowerCase();
+
+      // Same-origin browser requests (including preview proxy host matching request Host)
+      if (reqHost && parsed.host.toLowerCase() === reqHost) {
+        callback(null, { ...baseOpts, origin: true });
         return;
       }
-      if (rawOrigins.includes(origin)) {
-        callback(null, true);
+
+      // Local development convenience ONLY when not in production
+      if (
+        !isProd &&
+        (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1")
+      ) {
+        callback(null, { ...baseOpts, origin: true });
         return;
       }
-      // Allow local dev / preview hosts on standard http(s) ports when no strict list overrides
-      try {
-        const parsed = new URL(origin);
-        const host = parsed.hostname;
-        if (
-          host === "localhost" ||
-          host === "127.0.0.1" ||
-          host.endsWith(".run.app") ||
-          host.endsWith(".googleusercontent.com")
-        ) {
-          callback(null, true);
-          return;
-        }
-      } catch {
-        // invalid origin
-      }
-      callback(null, false);
-    },
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Idempotency-Key"],
+    } catch {
+      // invalid URL origin
+    }
+
+    callback(null, { ...baseOpts, origin: false });
   };
 }
 
@@ -69,14 +107,28 @@ interface RateBucket {
   resetAt: number;
 }
 
+const HIGH_BURST_ROLES = new Set([
+  "SPORTS_SECRETARY",
+  "FACULTY_ADVISOR",
+  "AUCTION_OPERATOR",
+  "MATCH_SCORER",
+]);
+
+/**
+ * Campus-NAT-safe rate limiter:
+ * - Uses Express `req.ip` (which safely honors `trust proxy` and ignores spoofed X-Forwarded-For).
+ * - Keys authenticated users by `user:<id>` so 1,200 students behind campus NAT don't share one IP bucket.
+ * - Grants high burst limits or exemptions to live operators, match scorers, and sports admins.
+ */
 export function createRateLimiter(options: {
   windowMs: number;
   maxRequests: number;
+  privilegedMaxRequests?: number;
+  exemptPrivileged?: boolean;
   keyPrefix: string;
 }) {
   const buckets = new Map<string, RateBucket>();
 
-  // Periodic cleanup to avoid unbounded memory growth
   const cleanupTimer = setInterval(() => {
     const now = Date.now();
     for (const [key, bucket] of buckets.entries()) {
@@ -88,11 +140,24 @@ export function createRateLimiter(options: {
   cleanupTimer.unref();
 
   return (req: Request, res: Response, next: NextFunction) => {
-    const ip =
-      (typeof req.headers["x-forwarded-for"] === "string"
-        ? req.headers["x-forwarded-for"].split(",")[0].trim()
-        : req.ip) || "unknown";
-    const key = `${options.keyPrefix}:${ip}`;
+    const actor = req.authUser;
+    const isPrivileged = Boolean(actor && HIGH_BURST_ROLES.has(actor.role));
+
+    if (isPrivileged && options.exemptPrivileged) {
+      return next();
+    }
+
+    const limit =
+      isPrivileged && options.privilegedMaxRequests
+        ? options.privilegedMaxRequests
+        : options.maxRequests;
+
+    // Key by authenticated userId when logged in; fall back to Express req.ip (never raw X-Forwarded-For)
+    const identityKey = actor
+      ? `uid:${actor.id}`
+      : `ip:${req.ip || req.socket.remoteAddress || "unknown"}`;
+
+    const key = `${options.keyPrefix}:${identityKey}`;
     const now = Date.now();
     let bucket = buckets.get(key);
     if (!bucket || bucket.resetAt <= now) {
@@ -100,12 +165,13 @@ export function createRateLimiter(options: {
       buckets.set(key, bucket);
     }
     bucket.count += 1;
-    res.setHeader("X-RateLimit-Limit", String(options.maxRequests));
+
+    res.setHeader("X-RateLimit-Limit", String(limit));
     res.setHeader(
       "X-RateLimit-Remaining",
-      String(Math.max(0, options.maxRequests - bucket.count))
+      String(Math.max(0, limit - bucket.count))
     );
-    if (bucket.count > options.maxRequests) {
+    if (bucket.count > limit) {
       res.status(429).json({
         error: "Too many requests. Please wait a moment and try again.",
       });
@@ -131,11 +197,9 @@ export function detectImageMimeFromBuffer(
   buf: Buffer
 ): "image/jpeg" | "image/png" | "image/webp" | "image/gif" | null {
   if (buf.length < 12) return null;
-  // JPEG: FF D8 FF
   if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
     return "image/jpeg";
   }
-  // PNG: 89 50 4E 47 0D 0A 1A 0A
   if (
     buf[0] === 0x89 &&
     buf[1] === 0x50 &&
@@ -148,7 +212,6 @@ export function detectImageMimeFromBuffer(
   ) {
     return "image/png";
   }
-  // GIF87a / GIF89a
   if (
     buf[0] === 0x47 &&
     buf[1] === 0x49 &&
@@ -159,7 +222,6 @@ export function detectImageMimeFromBuffer(
   ) {
     return "image/gif";
   }
-  // WebP: RIFF....WEBP
   if (
     buf[0] === 0x52 &&
     buf[1] === 0x49 &&

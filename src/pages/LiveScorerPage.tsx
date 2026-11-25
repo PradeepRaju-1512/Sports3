@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useSearchParams } from "react-router-dom";
 import type { DemoUser } from "../App";
 import { apiFetch } from "../lib/api";
+import { useLiveMatchesStream } from "../hooks/useLiveMatchesStream";
 import {
   applyClientAction,
   createInitialScorerClientState,
@@ -22,7 +23,7 @@ import type {
   ViewportMode,
 } from "../scoring/types";
 
-interface LiveTournamentMatch {
+export interface LiveTournamentMatch {
   id: number;
   sportName: string;
   stage: string;
@@ -33,6 +34,22 @@ interface LiveTournamentMatch {
   status: string;
   venue: string;
   scorerUserId?: number | null;
+  version?: number;
+  updatedAt?: string;
+}
+
+interface PersistedClockPayload {
+  clockAnchorMs: number | null;
+  clockAccumulatedMs: number;
+  clockRunning: boolean;
+}
+
+interface OfflineMatchEnvelope {
+  version: number;
+  updatedAt: string;
+  dirty: boolean;
+  events: SportEvent[];
+  clock?: PersistedClockPayload;
 }
 
 interface SportSession {
@@ -42,7 +59,7 @@ interface SportSession {
   roster: MatchRoster;
 }
 
-const OFFLINE_KEY_PREFIX = "iiitt_scorer_events_v1_";
+const OFFLINE_KEY_PREFIX = "iiitt_scorer_v2_";
 
 function normalizeSportParam(raw: string | null): SportId {
   if (!raw) return "cricket";
@@ -58,21 +75,32 @@ function detectViewport(): ViewportMode {
   return window.innerWidth < 960 ? "mobile" : "pc";
 }
 
-function saveOfflineEvents(storageKey: string, events: SportEvent[]): boolean {
+function saveOfflineEnvelope(
+  storageKey: string,
+  envelope: OfflineMatchEnvelope
+): boolean {
   try {
-    window.localStorage.setItem(storageKey, JSON.stringify(events));
+    window.localStorage.setItem(storageKey, JSON.stringify(envelope));
     return true;
   } catch {
     return false;
   }
 }
 
-function loadOfflineEvents(storageKey: string): SportEvent[] | null {
+function loadOfflineEnvelope(storageKey: string): OfflineMatchEnvelope | null {
   try {
     const raw = window.localStorage.getItem(storageKey);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as SportEvent[]) : null;
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      Array.isArray(parsed.events) &&
+      typeof parsed.version === "number"
+    ) {
+      return parsed as OfflineMatchEnvelope;
+    }
+    return null;
   } catch {
     return null;
   }
@@ -138,25 +166,70 @@ export default function LiveScorerPage({
     [initialSport]: buildSession(initialSport, detectViewport()),
   }));
 
-  // Timestamp-based drift-free match clock
+  // Persisted drift-free match clock (synchronized with server)
   const [accumulatedMs, setAccumulatedMs] = useState(0);
   const [clockRunning, setClockRunning] = useState(false);
-  const clockStartedAtRef = useRef<number | null>(null);
+  const clockAnchorRef = useRef<number | null>(null);
   const [displayClockMs, setDisplayClockMs] = useState(0);
 
+  const [availableMatches, setAvailableMatches] = useState<
+    LiveTournamentMatch[]
+  >([]);
   const [linkedMatch, setLinkedMatch] = useState<LiveTournamentMatch | null>(
     null
   );
   const [serverCanEdit, setServerCanEdit] = useState(false);
+  const [serverVersion, setServerVersion] = useState<number>(1);
+  const serverVersionRef = useRef<number>(1);
   const [saving, setSaving] = useState(false);
   const [pushFeedback, setPushFeedback] = useState<string | null>(null);
   const [pushError, setPushError] = useState<string | null>(null);
   const [syncStatusLabel, setSyncStatusLabel] = useState<string>("Ready");
 
+  const getCurrentClockPayload = useCallback((): PersistedClockPayload => {
+    return {
+      clockAnchorMs: clockRunning ? clockAnchorRef.current : null,
+      clockAccumulatedMs: Math.max(0, Math.round(accumulatedMs)),
+      clockRunning,
+    };
+  }, [accumulatedMs, clockRunning]);
+
+  const applyServerClock = useCallback(
+    (clock?: Partial<PersistedClockPayload> | null) => {
+      if (!clock) {
+        clockAnchorRef.current = null;
+        setClockRunning(false);
+        setAccumulatedMs(0);
+        setDisplayClockMs(0);
+        return;
+      }
+      const acc = Math.max(0, Number(clock.clockAccumulatedMs || 0));
+      const running = Boolean(clock.clockRunning);
+      const anchor =
+        running &&
+        typeof clock.clockAnchorMs === "number" &&
+        clock.clockAnchorMs > 0
+          ? clock.clockAnchorMs
+          : running
+            ? Date.now()
+            : null;
+      clockAnchorRef.current = anchor;
+      setAccumulatedMs(acc);
+      setClockRunning(running);
+      setDisplayClockMs(
+        running && anchor !== null ? acc + Math.max(0, Date.now() - anchor) : acc
+      );
+    },
+    []
+  );
+
+  // Strict lifecycle gating: scoring controls active ONLY when linked match is LIVE
+  // (or standalone sandbox for official roles when no linked match exists)
   const canEdit = useMemo(() => {
     if (!currentUser) return false;
-    if (linkedMatch) return serverCanEdit;
-    // Standalone sandbox only editable by official roles (strictly read-only for students/guests)
+    if (linkedMatch) {
+      return serverCanEdit && linkedMatch.status === "LIVE";
+    }
     return [
       "MATCH_SCORER",
       "SPORTS_SECRETARY",
@@ -164,12 +237,17 @@ export default function LiveScorerPage({
     ].includes(currentUser.role);
   }, [currentUser, linkedMatch, serverCanEdit]);
 
+  const canGoLiveHere = Boolean(
+    currentUser &&
+      linkedMatch &&
+      serverCanEdit &&
+      linkedMatch.status === "UPCOMING"
+  );
+
   const canPushLiveScore = Boolean(canEdit && linkedMatch);
 
-  // Hydrate linked fixture, real team rosters, and persisted events from backend + localStorage queue
-  useEffect(() => {
-    let cancelled = false;
-    async function loadMatchAndEvents() {
+  const loadMatchAndEvents = useCallback(
+    async (opts?: { forceServer?: boolean }) => {
       try {
         const res = await apiFetch("/api/tournaments/current", {
           cache: "no-store",
@@ -177,11 +255,18 @@ export default function LiveScorerPage({
         if (!res.ok) return;
         const json = await res.json();
         const list: LiveTournamentMatch[] = json.matches || [];
+        const selectable = list.filter(
+          (m) => m.status === "LIVE" || m.status === "UPCOMING"
+        );
+        setAvailableMatches(selectable.length > 0 ? selectable : list);
+
         const picked = queryMatchId
           ? list.find((m) => String(m.id) === queryMatchId) ||
-            list.find((m) => m.status === "LIVE")
-          : list.find((m) => m.status === "LIVE");
-        if (!picked || cancelled) {
+            list.find((m) => m.status === "LIVE") ||
+            list[0]
+          : list.find((m) => m.status === "LIVE") || list[0];
+
+        if (!picked) {
           setLinkedMatch(null);
           setServerCanEdit(false);
           return;
@@ -191,33 +276,64 @@ export default function LiveScorerPage({
         const evRes = await apiFetch(`/api/matches/${picked.id}/events`, {
           cache: "no-store",
         });
-        if (!evRes.ok || cancelled) return;
+        if (!evRes.ok) return;
         const evData = await evRes.json();
-        if (cancelled) return;
 
         setServerCanEdit(Boolean(evData.canEdit));
+        const srvVersion = Number(evData.version ?? 1);
+        const srvUpdatedAt = String(evData.updatedAt || "");
+        setServerVersion(srvVersion);
+        serverVersionRef.current = srvVersion;
+
         const pickedSport = normalizeSportParam(picked.sportName);
-        if (!searchParams.get("sport")) {
-          setActiveSport(pickedSport);
-        }
+        setActiveSport(pickedSport);
 
         const storageKey = `${OFFLINE_KEY_PREFIX}${picked.id}`;
         const serverEvents: SportEvent[] = Array.isArray(evData.events)
           ? evData.events
           : [];
-        const localEvents = loadOfflineEvents(storageKey);
+        const localEnv = loadOfflineEnvelope(storageKey);
 
-        // Prefer whichever log has more recorded events (preserving unsynced offline edits)
-        const hydratedEvents =
-          localEvents && localEvents.length > serverEvents.length
-            ? localEvents
-            : serverEvents;
+        // Reconcile strictly by version & updatedAt (NEVER by events.length — undo/reset may shrink events!)
+        const localIsNewerUnsynced =
+          !opts?.forceServer &&
+          Boolean(evData.canEdit) &&
+          picked.status === "LIVE" &&
+          localEnv !== null &&
+          localEnv.dirty &&
+          localEnv.version === srvVersion &&
+          (!srvUpdatedAt ||
+            new Date(localEnv.updatedAt).getTime() >
+              new Date(srvUpdatedAt).getTime());
 
-        if (localEvents && localEvents.length > serverEvents.length) {
+        const hydratedEvents = localIsNewerUnsynced
+          ? localEnv!.events
+          : serverEvents;
+
+        if (localIsNewerUnsynced) {
           setSyncStatusLabel("Unsynced local edits restored");
+          if (localEnv?.clock) {
+            applyServerClock(localEnv.clock);
+          } else {
+            applyServerClock(evData.clock);
+          }
         } else {
+          applyServerClock(evData.clock);
+          saveOfflineEnvelope(storageKey, {
+            version: srvVersion,
+            updatedAt: srvUpdatedAt || new Date().toISOString(),
+            dirty: false,
+            events: serverEvents,
+            clock: evData.clock,
+          });
           setSyncStatusLabel(
-            serverEvents.length > 0 ? "Synced with server" : "Ready"
+            picked.status === "COMPLETED"
+              ? "Completed (Locked)"
+              : picked.status === "UPCOMING"
+                ? "Upcoming (Go Live to score)"
+                : serverEvents.length > 0
+                  ? `Synced v${srvVersion}`
+                  : `Live v${srvVersion}`
           );
         }
 
@@ -249,16 +365,24 @@ export default function LiveScorerPage({
           };
         });
       } catch {
-        if (!cancelled) {
-          setSyncStatusLabel("Offline mode");
-        }
+        setSyncStatusLabel("Offline mode");
       }
-    }
+    },
+    [queryMatchId, applyServerClock]
+  );
+
+  useEffect(() => {
     void loadMatchAndEvents();
-    return () => {
-      cancelled = true;
-    };
-  }, [queryMatchId, currentUser?.id]);
+  }, [loadMatchAndEvents, currentUser?.id]);
+
+  // Real-time SSE spectator updates when another scorer updates the match
+  useLiveMatchesStream({
+    onMatchUpdate: () => {
+      if (!canEdit) {
+        void loadMatchAndEvents({ forceServer: true });
+      }
+    },
+  });
 
   // Elapsed timestamp clock (zero drift across background tabs)
   useEffect(() => {
@@ -266,41 +390,20 @@ export default function LiveScorerPage({
       setDisplayClockMs(accumulatedMs);
       return;
     }
-    if (clockStartedAtRef.current === null) {
-      clockStartedAtRef.current = Date.now();
+    if (clockAnchorRef.current === null) {
+      clockAnchorRef.current = Date.now();
     }
     const tick = () => {
-      if (clockStartedAtRef.current !== null) {
-        setDisplayClockMs(accumulatedMs + (Date.now() - clockStartedAtRef.current));
+      if (clockAnchorRef.current !== null) {
+        setDisplayClockMs(
+          accumulatedMs + Math.max(0, Date.now() - clockAnchorRef.current)
+        );
       }
     };
     tick();
     const id = window.setInterval(tick, 250);
     return () => window.clearInterval(id);
   }, [clockRunning, accumulatedMs]);
-
-  const handleToggleClock = useCallback(() => {
-    if (!canEdit) return;
-    setClockRunning((running) => {
-      if (running) {
-        if (clockStartedAtRef.current !== null) {
-          setAccumulatedMs((prev) => prev + (Date.now() - clockStartedAtRef.current!));
-          clockStartedAtRef.current = null;
-        }
-        return false;
-      }
-      clockStartedAtRef.current = Date.now();
-      return true;
-    });
-  }, [canEdit]);
-
-  const handleResetClock = useCallback(() => {
-    if (!canEdit) return;
-    clockStartedAtRef.current = null;
-    setClockRunning(false);
-    setAccumulatedMs(0);
-    setDisplayClockMs(0);
-  }, [canEdit]);
 
   const currentSession = useMemo(() => {
     return (
@@ -311,61 +414,88 @@ export default function LiveScorerPage({
   const persistEventsToServer = useCallback(
     async (
       sessionToSave: SportSession,
-      sportId: SportId,
-      targetStatus: "LIVE" | "COMPLETED" = "LIVE"
+      _sportId: SportId,
+      options?: { completeMatch?: boolean; clockOverride?: PersistedClockPayload }
     ) => {
       if (!linkedMatch || !canEdit) return false;
-      const def = SPORT_REGISTRY[sportId];
-      const summary = def.formatScoreSummary(
-        sessionToSave.client.derived.sportState,
-        sessionToSave.roster
-      );
+      const completeMatch = Boolean(options?.completeMatch);
+      const clock = options?.clockOverride || getCurrentClockPayload();
 
       setSaving(true);
       setPushError(null);
       try {
+        // Never send status: "LIVE" on autosave; server enforces explicit Go-Live and derives scores/stats from events
         const res = await apiFetch(`/api/matches/${linkedMatch.id}/events`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             events: sessionToSave.allEvents,
-            derivedState: sessionToSave.client.derived.sportState,
-            scoreA: summary.scoreA,
-            scoreB: summary.scoreB,
-            status: targetStatus,
-            resultSummary: summary.statusLine,
-            detailedBreakdown: summary.breakdown,
+            expectedVersion: serverVersionRef.current,
+            completeMatch,
+            clock,
           }),
         });
+        const out = await res.json().catch(() => ({}));
+        if (res.status === 409) {
+          setPushError(
+            out.error ||
+              "Match was updated on another device. Reloading latest state..."
+          );
+          setSyncStatusLabel("Conflict — reloading");
+          await loadMatchAndEvents({ forceServer: true });
+          return false;
+        }
         if (!res.ok) {
-          const err = await res.json().catch(() => ({}));
-          setPushError(err.error || "Unable to save match events.");
+          setPushError(out.error || "Unable to save match events.");
           setSyncStatusLabel("Save failed");
           return false;
         }
-        saveOfflineEvents(
-          `${OFFLINE_KEY_PREFIX}${linkedMatch.id}`,
-          sessionToSave.allEvents
-        );
+        const nextVersion = Number(out.version ?? serverVersionRef.current + 1);
+        const nextUpdatedAt = String(out.updatedAt || new Date().toISOString());
+        setServerVersion(nextVersion);
+        serverVersionRef.current = nextVersion;
+
+        saveOfflineEnvelope(`${OFFLINE_KEY_PREFIX}${linkedMatch.id}`, {
+          version: nextVersion,
+          updatedAt: nextUpdatedAt,
+          dirty: false,
+          events: sessionToSave.allEvents,
+          clock: out.clock || clock,
+        });
+
+        if (completeMatch && out.match) {
+          setLinkedMatch((prev) =>
+            prev ? { ...prev, status: "COMPLETED", version: nextVersion } : prev
+          );
+        }
+
         setSyncStatusLabel(
-          targetStatus === "COMPLETED" ? "Match completed & synced" : "Synced"
+          completeMatch
+            ? "Completed & standings updated"
+            : `Synced v${nextVersion}`
         );
         setPushFeedback(
-          targetStatus === "COMPLETED"
-            ? `Match finalized (${summary.scoreA} – ${summary.scoreB}) and standings updated.`
-            : `Saved ${sessionToSave.allEvents.length} events (${summary.scoreA} – ${summary.scoreB}).`
+          completeMatch
+            ? `Match finalized (${out.derivedSummary?.scoreA ?? ""} – ${out.derivedSummary?.scoreB ?? ""}) and standings recalculated.`
+            : `Saved ${sessionToSave.allEvents.length} events (v${nextVersion}).`
         );
         onLiveStateChange();
         return true;
       } catch {
-        const storedLocally = saveOfflineEvents(
+        const storedLocally = saveOfflineEnvelope(
           `${OFFLINE_KEY_PREFIX}${linkedMatch.id}`,
-          sessionToSave.allEvents
+          {
+            version: serverVersionRef.current,
+            updatedAt: new Date().toISOString(),
+            dirty: true,
+            events: sessionToSave.allEvents,
+            clock,
+          }
         );
         setSyncStatusLabel(storedLocally ? "Queued offline" : "Sync failed");
         setPushError(
           storedLocally
-            ? "Network unavailable — events were saved to this browser's offline queue."
+            ? "Network unavailable — events were saved locally and will sync when back online."
             : "Network unavailable and browser local storage could not persist events."
         );
         return false;
@@ -373,7 +503,117 @@ export default function LiveScorerPage({
         setSaving(false);
       }
     },
-    [canEdit, linkedMatch, onLiveStateChange]
+    [
+      canEdit,
+      getCurrentClockPayload,
+      linkedMatch,
+      loadMatchAndEvents,
+      onLiveStateChange,
+    ]
+  );
+
+  const handleToggleClock = useCallback(() => {
+    if (!canEdit) return;
+    let nextClock: PersistedClockPayload;
+    if (clockRunning) {
+      const elapsed =
+        clockAnchorRef.current !== null
+          ? Math.max(0, Date.now() - clockAnchorRef.current)
+          : 0;
+      const nextAcc = accumulatedMs + elapsed;
+      clockAnchorRef.current = null;
+      setAccumulatedMs(nextAcc);
+      setClockRunning(false);
+      setDisplayClockMs(nextAcc);
+      nextClock = {
+        clockAnchorMs: null,
+        clockAccumulatedMs: nextAcc,
+        clockRunning: false,
+      };
+    } else {
+      const anchor = Date.now();
+      clockAnchorRef.current = anchor;
+      setClockRunning(true);
+      nextClock = {
+        clockAnchorMs: anchor,
+        clockAccumulatedMs: accumulatedMs,
+        clockRunning: true,
+      };
+    }
+    if (linkedMatch) {
+      void persistEventsToServer(currentSession, activeSport, {
+        clockOverride: nextClock,
+      });
+    }
+  }, [
+    accumulatedMs,
+    activeSport,
+    canEdit,
+    clockRunning,
+    currentSession,
+    linkedMatch,
+    persistEventsToServer,
+  ]);
+
+  const handleResetClock = useCallback(() => {
+    if (!canEdit) return;
+    clockAnchorRef.current = null;
+    setClockRunning(false);
+    setAccumulatedMs(0);
+    setDisplayClockMs(0);
+    if (linkedMatch) {
+      void persistEventsToServer(currentSession, activeSport, {
+        clockOverride: {
+          clockAnchorMs: null,
+          clockAccumulatedMs: 0,
+          clockRunning: false,
+        },
+      });
+    }
+  }, [activeSport, canEdit, currentSession, linkedMatch, persistEventsToServer]);
+
+  const handleGoLive = useCallback(async () => {
+    if (!linkedMatch || !canGoLiveHere) return;
+    setSaving(true);
+    setPushError(null);
+    setPushFeedback(null);
+    try {
+      const res = await apiFetch(`/api/matches/${linkedMatch.id}/go-live`, {
+        method: "POST",
+      });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setPushError(out.error || "Unable to start match.");
+        return;
+      }
+      setPushFeedback("Match is now LIVE. Scoring pad unlocked.");
+      await loadMatchAndEvents({ forceServer: true });
+      onLiveStateChange();
+    } catch {
+      setPushError("Network error starting match.");
+    } finally {
+      setSaving(false);
+    }
+  }, [canGoLiveHere, linkedMatch, loadMatchAndEvents, onLiveStateChange]);
+
+  const handleSelectMatch = useCallback(
+    (matchId: number) => {
+      const found = availableMatches.find((m) => m.id === matchId);
+      setPushFeedback(null);
+      setPushError(null);
+      setSearchParams(
+        (prev) => {
+          const copy = new URLSearchParams(prev);
+          copy.set("matchId", String(matchId));
+          if (found) {
+            copy.set("sport", normalizeSportParam(found.sportName));
+          }
+          return copy;
+        },
+        { replace: true }
+      );
+    },
+    [availableMatches, setSearchParams]
   );
 
   // Auto-save timer ref for seamless background server sync after scoring actions
@@ -393,7 +633,13 @@ export default function LiveScorerPage({
         action.type === "UNDO_LAST" ||
         action.type === "EDIT_EVENT";
       if (isMutationAction && !canEdit) {
-        setPushError("Read-only mode: you are not assigned to score this match.");
+        setPushError(
+          linkedMatch?.status === "UPCOMING"
+            ? "Match is UPCOMING. Click Go Live to unlock scoring."
+            : linkedMatch?.status === "COMPLETED"
+              ? "Match is COMPLETED and locked."
+              : "Read-only mode: you are not assigned to score this match."
+        );
         return;
       }
 
@@ -422,14 +668,22 @@ export default function LiveScorerPage({
           const storageKey = linkedMatch
             ? `${OFFLINE_KEY_PREFIX}${linkedMatch.id}`
             : `${OFFLINE_KEY_PREFIX}sandbox_${activeSport}`;
-          const savedLocal = saveOfflineEvents(storageKey, next.allEvents);
+          const savedLocal = saveOfflineEnvelope(storageKey, {
+            version: serverVersionRef.current,
+            updatedAt: new Date().toISOString(),
+            dirty: true,
+            events: next.allEvents,
+            clock: getCurrentClockPayload(),
+          });
           if (linkedMatch && canEdit) {
             setSyncStatusLabel(savedLocal ? "Saving..." : "Syncing...");
             if (autoSaveTimerRef.current) {
               window.clearTimeout(autoSaveTimerRef.current);
             }
             autoSaveTimerRef.current = window.setTimeout(() => {
-              void persistEventsToServer(updatedSession, activeSport, "LIVE");
+              void persistEventsToServer(updatedSession, activeSport, {
+                completeMatch: false,
+              });
             }, 600);
           }
         }
@@ -440,7 +694,13 @@ export default function LiveScorerPage({
         };
       });
     },
-    [activeSport, canEdit, linkedMatch, persistEventsToServer]
+    [
+      activeSport,
+      canEdit,
+      getCurrentClockPayload,
+      linkedMatch,
+      persistEventsToServer,
+    ]
   );
 
   const handleChangeSport = useCallback(
@@ -472,7 +732,7 @@ export default function LiveScorerPage({
             },
           };
         }
-        const savedSandbox = loadOfflineEvents(
+        const savedSandbox = loadOfflineEnvelope(
           `${OFFLINE_KEY_PREFIX}sandbox_${nextSport}`
         );
         return {
@@ -482,7 +742,7 @@ export default function LiveScorerPage({
             currentVp,
             undefined,
             undefined,
-            savedSandbox || []
+            savedSandbox?.events || []
           ),
         };
       });
@@ -505,35 +765,50 @@ export default function LiveScorerPage({
       ...prev,
       [activeSport]: fresh,
     }));
+    const resetClock: PersistedClockPayload = {
+      clockAnchorMs: null,
+      clockAccumulatedMs: 0,
+      clockRunning: false,
+    };
+    clockAnchorRef.current = null;
+    setClockRunning(false);
+    setAccumulatedMs(0);
+    setDisplayClockMs(0);
+
     const storageKey = linkedMatch
       ? `${OFFLINE_KEY_PREFIX}${linkedMatch.id}`
       : `${OFFLINE_KEY_PREFIX}sandbox_${activeSport}`;
-    saveOfflineEvents(storageKey, []);
-    handleResetClock();
+    saveOfflineEnvelope(storageKey, {
+      version: serverVersionRef.current,
+      updatedAt: new Date().toISOString(),
+      dirty: true,
+      events: [],
+      clock: resetClock,
+    });
     setPushFeedback(null);
     setPushError(null);
     if (linkedMatch) {
-      void persistEventsToServer(fresh, activeSport, "LIVE");
+      void persistEventsToServer(fresh, activeSport, {
+        completeMatch: false,
+        clockOverride: resetClock,
+      });
     }
-  }, [
-    activeSport,
-    canEdit,
-    handleResetClock,
-    linkedMatch,
-    persistEventsToServer,
-    sessions,
-  ]);
+  }, [activeSport, canEdit, linkedMatch, persistEventsToServer, sessions]);
 
   const handlePushLiveScore = useCallback(() => {
-    void persistEventsToServer(currentSession, activeSport, "LIVE");
+    void persistEventsToServer(currentSession, activeSport, {
+      completeMatch: false,
+    });
   }, [activeSport, currentSession, persistEventsToServer]);
 
   const handleCompleteMatch = useCallback(() => {
-    void persistEventsToServer(currentSession, activeSport, "COMPLETED");
+    void persistEventsToServer(currentSession, activeSport, {
+      completeMatch: true,
+    });
   }, [activeSport, currentSession, persistEventsToServer]);
 
   const linkedLabel = linkedMatch
-    ? `${linkedMatch.sportName}: ${linkedMatch.teamA} vs ${linkedMatch.teamB}`
+    ? `[${linkedMatch.status}] ${linkedMatch.sportName}: ${linkedMatch.teamA} vs ${linkedMatch.teamB} (v${serverVersion})`
     : null;
 
   return (
@@ -544,6 +819,46 @@ export default function LiveScorerPage({
           : "scorer-page-pc-frame"
       }
     >
+      {/* Match Selector Bar when multiple tournament matches exist */}
+      {availableMatches.length > 0 && (
+        <div className="scorer-match-selector-bar">
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            <strong style={{ fontSize: 12, textTransform: "uppercase", color: "#d4a038" }}>
+              Fixture:
+            </strong>
+            <select
+              className="scorer-sport-select"
+              aria-label="Select match"
+              value={linkedMatch ? String(linkedMatch.id) : ""}
+              onChange={(e) => handleSelectMatch(Number(e.target.value))}
+            >
+              {availableMatches.map((m) => (
+                <option key={m.id} value={m.id}>
+                  [{m.status}] {m.sportName} · {m.teamA} vs {m.teamB} ({m.stage})
+                </option>
+              ))}
+            </select>
+            {canGoLiveHere && (
+              <button
+                type="button"
+                className="action-btn"
+                style={{ padding: "5px 12px", fontSize: 12 }}
+                disabled={saving}
+                onClick={handleGoLive}
+              >
+                {saving ? "Starting..." : "Go Live & Unlock Scorer"}
+              </button>
+            )}
+          </div>
+          <span className="muted" style={{ fontSize: 12 }}>
+            {linkedMatch?.status === "LIVE"
+              ? "● LIVE"
+              : linkedMatch?.status || "SANDBOX"}{" "}
+            · {syncStatusLabel}
+          </span>
+        </div>
+      )}
+
       <MatchScorerShell
         state={currentSession.client}
         allEvents={currentSession.allEvents}

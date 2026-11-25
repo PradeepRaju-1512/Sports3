@@ -10,7 +10,14 @@ import AuctionPage from "./pages/AuctionPage";
 import LiveAuctionPage from "./pages/LiveAuctionPage";
 import LiveScorerPage from "./pages/LiveScorerPage";
 import PlayerProfilePage from "./pages/PlayerProfilePage";
+import LoginPage from "./pages/LoginPage";
+import AdminRolesPage from "./pages/AdminRolesPage";
+import NotFoundPage from "./pages/NotFoundPage";
 import { apiFetch, formatLocalDateTime, setAuthToken } from "./lib/api";
+import {
+  useLiveMatchesStream,
+  type LiveNavSnapshot,
+} from "./hooks/useLiveMatchesStream";
 
 export interface DemoUser {
   id: number;
@@ -51,6 +58,7 @@ export interface NotificationItem {
 
 export interface BootstrapData {
   demoSwitcherEnabled: boolean;
+  googleOAuthEnabled?: boolean;
   alertBanner: string | null;
   notices: NoticeItem[];
   clubs: ClubItem[];
@@ -58,6 +66,8 @@ export interface BootstrapData {
   currentUser: DemoUser | null;
   hasLiveMatches: boolean;
   archiveYears: number[];
+  showAuctionInNav?: boolean;
+  showLiveAuctionInNav?: boolean;
   auctionPlanned?: boolean;
   liveAuctionActive?: boolean;
   auctionStatus?: string;
@@ -65,6 +75,7 @@ export interface BootstrapData {
 
 export default function App() {
   const [data, setData] = useState<BootstrapData | null>(null);
+  const [bootstrapping, setBootstrapping] = useState(true);
   const [currentUser, setCurrentUser] = useState<DemoUser | null>(null);
   const [archiveOpen, setArchiveOpen] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -91,12 +102,44 @@ export default function App() {
     }
   }, []);
 
+  const refreshBootstrap = useCallback(async () => {
+    try {
+      const r = await apiFetch("/api/bootstrap", { cache: "no-store" });
+      if (!r.ok) return;
+      const d: BootstrapData = await r.json();
+      setData(d);
+      setCurrentUser(d.currentUser || null);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setBootstrapping(false);
+    }
+  }, []);
+
+  const handleNavUpdate = useCallback((nav: LiveNavSnapshot) => {
+    setData((prev) =>
+      prev
+        ? {
+            ...prev,
+            hasLiveMatches: nav.hasLiveMatches,
+            auctionPlanned: nav.showAuctionInNav,
+            liveAuctionActive: nav.showLiveAuctionInNav,
+            auctionStatus: nav.auctionStatus,
+            alertBanner: nav.alertBanner,
+          }
+        : prev
+    );
+  }, []);
+
+  // Subscribe to real-time live match & nav state SSE updates
+  useLiveMatchesStream({ onNavUpdate: handleNavUpdate });
+
   const signInDemoUser = useCallback(
     async (userId: number) => {
       setSwitchingRole(true);
       setAuthError(null);
       try {
-        const res = await fetch("/api/auth/demo-login", {
+        const res = await apiFetch("/api/auth/demo-login", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ userId }),
@@ -119,7 +162,12 @@ export default function App() {
     [loadNotifications]
   );
 
-  const signOut = useCallback(() => {
+  const signOut = useCallback(async () => {
+    try {
+      await apiFetch("/api/auth/logout", { method: "POST" });
+    } catch {
+      // ignore network error; clear local session state regardless
+    }
     setAuthToken(null);
     setCurrentUser(null);
     setNotifications([]);
@@ -127,37 +175,18 @@ export default function App() {
     setNotifOpen(false);
   }, []);
 
-  const refreshBootstrap = useCallback(async () => {
-    try {
-      const r = await apiFetch("/api/bootstrap", { cache: "no-store" });
-      if (!r.ok) return;
-      const d: BootstrapData = await r.json();
-      setData(d);
-      if (d.currentUser) {
-        setCurrentUser(d.currentUser);
-      }
-    } catch (err) {
-      console.error(err);
-    }
-  }, []);
+  const handleSignedIn = useCallback(
+    async (user: DemoUser) => {
+      setCurrentUser(user);
+      await loadNotifications();
+      await refreshBootstrap();
+    },
+    [loadNotifications, refreshBootstrap]
+  );
 
   useEffect(() => {
-    refreshBootstrap();
+    void refreshBootstrap();
   }, [refreshBootstrap]);
-
-  // Auto-authenticate first demo persona once when ENABLE_DEMO_SWITCHER=true and not yet signed in
-  const [autoLoginTried, setAutoLoginTried] = useState(false);
-  useEffect(() => {
-    if (
-      !autoLoginTried &&
-      data?.demoSwitcherEnabled &&
-      !currentUser &&
-      data.users.length > 0
-    ) {
-      setAutoLoginTried(true);
-      void signInDemoUser(data.users[0].id);
-    }
-  }, [autoLoginTried, data, currentUser, signInDemoUser]);
 
   // Refresh notifications periodically when signed in
   useEffect(() => {
@@ -199,14 +228,41 @@ export default function App() {
     }
   }
 
+  if (bootstrapping) {
+    return (
+      <div className="bootstrap-loader">
+        <div className="bootstrap-loader-card">
+          <div className="bootstrap-spinner" />
+          <div style={{ fontWeight: 800, letterSpacing: "0.08em", color: "#d4a038" }}>
+            IIIT TRICHY SPORTS
+          </div>
+          <div className="muted" style={{ fontSize: 13 }}>
+            Loading clubs, schedules, and live feeds...
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   const hasLive = Boolean(data?.hasLiveMatches);
   const archiveYears = data?.archiveYears || [2025, 2024];
-  const auctionPlanned =
-    data?.auctionPlanned !== undefined ? Boolean(data.auctionPlanned) : false;
-  const liveAuctionActive =
-    data?.liveAuctionActive !== undefined
-      ? Boolean(data.liveAuctionActive)
-      : false;
+  const auctionPlanned = Boolean(data?.auctionPlanned);
+  const liveAuctionActive = Boolean(data?.liveAuctionActive);
+
+  // Hide Match Scorer link from main nav for public guests & regular students
+  // (spectators can still click any live/upcoming match card to open read-only /scorer?matchId=...)
+  const showScorerInNav = Boolean(
+    currentUser &&
+      ["MATCH_SCORER", "SPORTS_SECRETARY", "FACULTY_ADVISOR"].includes(
+        currentUser.role
+      )
+  );
+  const showAdminInNav = Boolean(
+    currentUser &&
+      ["SPORTS_SECRETARY", "FACULTY_ADVISOR", "CLUB_SECRETARY"].includes(
+        currentUser.role
+      )
+  );
 
   const closeMenus = () => {
     setMobileMenuOpen(false);
@@ -273,13 +329,21 @@ export default function App() {
               </Link>
             )}
 
-            <Link to="/scorer" onClick={closeMenus}>
-              Match Scorer
-            </Link>
+            {showScorerInNav && (
+              <Link to="/scorer" onClick={closeMenus}>
+                Match Scorer
+              </Link>
+            )}
 
             <Link to={hasLive ? "/live" : "/upcoming"} onClick={closeMenus}>
               {hasLive ? "Live" : "Upcoming"}
             </Link>
+
+            {showAdminInNav && (
+              <Link to="/admin" onClick={closeMenus}>
+                Roles &amp; Admin
+              </Link>
+            )}
           </nav>
         </div>
 
@@ -316,7 +380,10 @@ export default function App() {
                     )}
                   </div>
                   {notifications.length === 0 ? (
-                    <p className="muted" style={{ padding: "10px 12px", margin: 0 }}>
+                    <p
+                      className="muted"
+                      style={{ padding: "10px 12px", margin: 0 }}
+                    >
                       No notifications yet.
                     </p>
                   ) : (
@@ -352,19 +419,19 @@ export default function App() {
 
           {data?.demoSwitcherEnabled && (
             <div className="role-switcher-wrap">
-              <span className="muted role-label">Role:</span>
+              <span className="muted role-label">Demo:</span>
               <select
                 disabled={switchingRole}
                 value={currentUser ? String(currentUser.id) : "GUEST"}
                 onChange={(e) => {
                   if (e.target.value === "GUEST") {
-                    signOut();
+                    void signOut();
                     return;
                   }
                   void signInDemoUser(Number(e.target.value));
                 }}
               >
-                <option value="GUEST">Guest (Read-Only)</option>
+                <option value="GUEST">Public Guest</option>
                 {data.users.map((u) => (
                   <option key={u.id} value={u.id}>
                     {u.name} ({u.role})
@@ -372,6 +439,33 @@ export default function App() {
                 ))}
               </select>
             </div>
+          )}
+
+          {currentUser ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span
+                className="muted"
+                style={{ fontSize: 12, whiteSpace: "nowrap" }}
+              >
+                {currentUser.name}
+              </span>
+              <button
+                type="button"
+                className="nav-pill"
+                onClick={() => void signOut()}
+              >
+                Sign Out
+              </button>
+            </div>
+          ) : (
+            <Link
+              to="/login"
+              className="nav-pill"
+              style={{ textDecoration: "none", color: "#d4a038" }}
+              onClick={closeMenus}
+            >
+              Sign In
+            </Link>
           )}
         </div>
       </header>
@@ -386,6 +480,26 @@ export default function App() {
         <Route
           path="/"
           element={<HomePage data={data} currentUser={currentUser} />}
+        />
+        <Route
+          path="/login"
+          element={
+            <LoginPage
+              currentUser={currentUser}
+              googleOAuthEnabled={Boolean(data?.googleOAuthEnabled)}
+              onSignedIn={handleSignedIn}
+              onSignOut={signOut}
+            />
+          }
+        />
+        <Route
+          path="/admin"
+          element={
+            <AdminRolesPage
+              currentUser={currentUser}
+              onBootstrapChange={refreshBootstrap}
+            />
+          }
         />
         <Route
           path="/clubs/:slug"
@@ -452,6 +566,7 @@ export default function App() {
           }
         />
         <Route path="/players/:id" element={<PlayerProfilePage />} />
+        <Route path="*" element={<NotFoundPage />} />
       </Routes>
     </div>
   );
