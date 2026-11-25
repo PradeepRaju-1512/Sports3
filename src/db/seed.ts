@@ -12,6 +12,10 @@ import {
   tournamentTeams,
   teamRosterMembers,
   tournamentMatches,
+  auctions,
+  auctionRounds,
+  auctionFranchises,
+  auctionRegistrations,
 } from "./schema.js";
 
 const NINE_CLUBS = [
@@ -768,6 +772,424 @@ async function seed() {
           scorerUserId: scorerUser?.id || null,
         },
       ]);
+    }
+  }
+
+  const [{ value: existingAuctions }] = await db
+    .select({ value: count() })
+    .from(auctions);
+
+  let seededAuctionId = 1;
+  if (existingAuctions === 0) {
+    const [createdAuction] = await db
+      .insert(auctions)
+      .values({
+        name: "Prothymos 2027 Mega Auction",
+        seasonYear: 2027,
+        sportsJson: JSON.stringify([
+          "Cricket",
+          "Football",
+          "Volleyball",
+          "Badminton",
+          "Kabaddi",
+        ]),
+        status: "REGISTRATION_OPEN",
+        registrationDeadline: "Feb 08, 2027 · 11:59 PM",
+        clubBasePrice: 10000,
+        nonClubBasePrice: 5000,
+        sportBasePricesJson: JSON.stringify({
+          Football: { clubBasePrice: 8000, nonClubBasePrice: 4000 },
+          Badminton: { clubBasePrice: 6000, nonClubBasePrice: 3000 },
+        }),
+        defaultIncrement: 1000,
+        jumpIncrement: 5000,
+        minSquadSize: 8,
+        maxSquadSize: 15,
+        minClubPlayers: 3,
+        minNonClubPlayers: 2,
+        playerTiersJson: JSON.stringify([
+          "MARQUEE",
+          "TIER_1",
+          "TIER_2",
+          "UNCAPPED",
+        ]),
+        positionsBySportJson: JSON.stringify({
+          Cricket: ["Batsman", "Bowler", "All-Rounder", "Wicketkeeper"],
+          Football: [
+            "Forward / Striker",
+            "Midfielder",
+            "Defender",
+            "Goalkeeper",
+          ],
+          Volleyball: ["Setter", "Outside Hitter", "Middle Blocker", "Libero"],
+          Badminton: ["Singles", "Doubles", "Mixed"],
+          Kabaddi: ["Raider", "Defender", "All-Rounder"],
+          "Table Tennis": ["Singles", "Doubles"],
+          "Kho Kho": ["Attacker / Chaser", "Defender / Runner"],
+          Chess: ["Board 1–2", "Board 3–4", "Reserve"],
+          Carrom: ["Singles", "Doubles"],
+        }),
+        activeRoundId: 1,
+        activeSport: "Cricket",
+        currentPlayerId: null,
+        projectorMode: "STAGE",
+      })
+      .returning();
+    if (createdAuction) seededAuctionId = createdAuction.id;
+  } else {
+    const [firstAuction] = await db.select().from(auctions).limit(1);
+    if (firstAuction) seededAuctionId = firstAuction.id;
+  }
+
+  const [{ value: existingRounds }] = await db
+    .select({ value: count() })
+    .from(auctionRounds);
+
+  let firstRoundId = 1;
+  if (existingRounds === 0) {
+    const insertedRounds = await db
+      .insert(auctionRounds)
+      .values([
+        {
+          auctionId: seededAuctionId,
+          roundNumber: 1,
+          name: "Round 1 · Main Pool",
+          status: "ACTIVE",
+        },
+        {
+          auctionId: seededAuctionId,
+          roundNumber: 2,
+          name: "Round 2 · Accelerated / Unsold",
+          status: "PENDING",
+        },
+        {
+          auctionId: seededAuctionId,
+          roundNumber: 3,
+          name: "Round 3 · RTM / Final",
+          status: "PENDING",
+        },
+      ])
+      .returning();
+    if (insertedRounds[0]) firstRoundId = insertedRounds[0].id;
+  } else {
+    const [firstRound] = await db.select().from(auctionRounds).limit(1);
+    if (firstRound) firstRoundId = firstRound.id;
+  }
+
+  const [{ value: existingFranchises }] = await db
+    .select({ value: count() })
+    .from(auctionFranchises);
+
+  let cricketTitansId = 1;
+  let footballKaveriId = 5;
+  if (existingFranchises === 0) {
+    const insertedFranchises = await db
+      .insert(auctionFranchises)
+      .values([
+        {
+          auctionId: seededAuctionId,
+          sport: "Cricket",
+          slotNumber: 1,
+          name: "Trichy Titans",
+          shortCode: "TT",
+          accentColor: "#d4a038",
+          captainName: "Karthik Nair",
+          startingPurse: 150000,
+        },
+        {
+          auctionId: seededAuctionId,
+          sport: "Cricket",
+          slotNumber: 2,
+          name: "Cauvery Kings",
+          shortCode: "CK",
+          accentColor: "#b91c1c",
+          captainName: "Vikram Rao",
+          startingPurse: 150000,
+        },
+        {
+          auctionId: seededAuctionId,
+          sport: "Cricket",
+          slotNumber: 3,
+          name: "Chola Rovers",
+          shortCode: "CR",
+          accentColor: "#2563eb",
+          captainName: "Arjun Das",
+          startingPurse: 150000,
+        },
+        {
+          auctionId: seededAuctionId,
+          sport: "Cricket",
+          slotNumber: 4,
+          name: "Pallava Strikers",
+          shortCode: "PS",
+          accentColor: "#16a34a",
+          captainName: "Siddharth Iyer",
+          startingPurse: 150000,
+        },
+        {
+          auctionId: seededAuctionId,
+          sport: "Football",
+          slotNumber: 1,
+          name: "Kaveri United",
+          shortCode: "KU",
+          accentColor: "#d4a038",
+          captainName: "Karthik Nair",
+          startingPurse: 120000,
+        },
+        {
+          auctionId: seededAuctionId,
+          sport: "Football",
+          slotNumber: 2,
+          name: "Chola Rovers FC",
+          shortCode: "CR",
+          accentColor: "#b91c1c",
+          captainName: "Vikram Rao",
+          startingPurse: 120000,
+        },
+        {
+          auctionId: seededAuctionId,
+          sport: "Football",
+          slotNumber: 3,
+          name: "Rockfort XI",
+          shortCode: "RX",
+          accentColor: "#2563eb",
+          captainName: "Aditi Menon",
+          startingPurse: 120000,
+        },
+        {
+          auctionId: seededAuctionId,
+          sport: "Football",
+          slotNumber: 4,
+          name: "Delta Dynamos FC",
+          shortCode: "DD",
+          accentColor: "#16a34a",
+          captainName: "Rohan Verma",
+          startingPurse: 120000,
+        },
+        {
+          auctionId: seededAuctionId,
+          sport: "Volleyball",
+          slotNumber: 1,
+          name: "Trichy Spikers",
+          shortCode: "TS",
+          accentColor: "#d4a038",
+          captainName: "Vikram Rao",
+          startingPurse: 100000,
+        },
+        {
+          auctionId: seededAuctionId,
+          sport: "Volleyball",
+          slotNumber: 2,
+          name: "Cauvery Blockers",
+          shortCode: "CB",
+          accentColor: "#b91c1c",
+          captainName: "Arjun Das",
+          startingPurse: 100000,
+        },
+        {
+          auctionId: seededAuctionId,
+          sport: "Badminton",
+          slotNumber: 1,
+          name: "Shuttlers United",
+          shortCode: "SU",
+          accentColor: "#d4a038",
+          captainName: "Aditi Menon",
+          startingPurse: 80000,
+        },
+        {
+          auctionId: seededAuctionId,
+          sport: "Badminton",
+          slotNumber: 2,
+          name: "Smash Royals",
+          shortCode: "SR",
+          accentColor: "#2563eb",
+          captainName: "Karthik Nair",
+          startingPurse: 80000,
+        },
+        {
+          auctionId: seededAuctionId,
+          sport: "Kabaddi",
+          slotNumber: 1,
+          name: "Chola Raiders",
+          shortCode: "CR",
+          accentColor: "#b91c1c",
+          captainName: "Arjun Das",
+          startingPurse: 100000,
+        },
+        {
+          auctionId: seededAuctionId,
+          sport: "Kabaddi",
+          slotNumber: 2,
+          name: "Trichy Defenders",
+          shortCode: "TD",
+          accentColor: "#16a34a",
+          captainName: "Vikram Rao",
+          startingPurse: 100000,
+        },
+      ])
+      .returning();
+    cricketTitansId =
+      insertedFranchises.find((f) => f.sport === "Cricket")?.id ?? 1;
+    footballKaveriId =
+      insertedFranchises.find((f) => f.sport === "Football")?.id ?? 5;
+  } else {
+    const allF = await db.select().from(auctionFranchises);
+    cricketTitansId = allF.find((f) => f.sport === "Cricket")?.id ?? 1;
+    footballKaveriId = allF.find((f) => f.sport === "Football")?.id ?? 5;
+  }
+
+  const [{ value: existingAuctionRegs }] = await db
+    .select({ value: count() })
+    .from(auctionRegistrations);
+
+  if (existingAuctionRegs === 0) {
+    const rohan = allUsers.find((u) => u.email === "rohan.24@iiitt.ac.in");
+    const aditi = allUsers.find((u) => u.email === "aditi.23@iiitt.ac.in");
+    const siddharth = allUsers.find(
+      (u) => u.email === "siddharth.m25@iiitt.ac.in"
+    );
+    const meera = allUsers.find((u) => u.email === "meera.25@iiitt.ac.in");
+    const ananya = allUsers.find((u) => u.email === "ananya.25@iiitt.ac.in");
+    const arjun = allUsers.find((u) => u.email === "arjun.23@iiitt.ac.in");
+
+    const rows = [
+      rohan && {
+        auctionId: seededAuctionId,
+        userId: rohan.id,
+        playerName: rohan.name,
+        rollNumber: rohan.rollNumber || "CS24B1041",
+        yearLabel: "2nd Year",
+        branch: rohan.branch,
+        sport: "Cricket",
+        positionsJson: JSON.stringify(["All-Rounder", "Bowler"]),
+        playerClass: "CLUB",
+        basePrice: 10000,
+        tier: "MARQUEE",
+        roundId: firstRoundId,
+        status: "IN_AUCTION",
+        soldToFranchiseId: null,
+        soldPrice: null,
+        statsSummary: "2026 Top Scorer · 185 runs & 9 wickets in 4 matches",
+        photoUrl: "/uploads/players/rohan-verma.jpg",
+      },
+      aditi && {
+        auctionId: seededAuctionId,
+        userId: aditi.id,
+        playerName: aditi.name,
+        rollNumber: aditi.rollNumber || "EC23B1024",
+        yearLabel: "3rd Year",
+        branch: aditi.branch,
+        sport: "Cricket",
+        positionsJson: JSON.stringify(["Batsman", "Wicketkeeper"]),
+        playerClass: "CLUB",
+        basePrice: 10000,
+        tier: "MARQUEE",
+        roundId: firstRoundId,
+        status: "ELIGIBLE",
+        soldToFranchiseId: null,
+        soldPrice: null,
+        statsSummary: "Prothymos 2025 Opening Match POTM (71 runs)",
+        photoUrl: "/uploads/players/aditi-menon.jpg",
+      },
+      siddharth && {
+        auctionId: seededAuctionId,
+        userId: siddharth.id,
+        playerName: siddharth.name,
+        rollNumber: siddharth.rollNumber || "CS25M1005",
+        yearLabel: "MTech",
+        branch: siddharth.branch,
+        sport: "Football",
+        positionsJson: JSON.stringify(["Forward / Striker", "Midfielder"]),
+        playerClass: "CLUB",
+        basePrice: 8000,
+        tier: "MARQUEE",
+        roundId: firstRoundId,
+        status: "ELIGIBLE",
+        soldToFranchiseId: null,
+        soldPrice: null,
+        statsSummary: "2024 Golden Boot · 7 goals in Autumn Sports Meet",
+        photoUrl: "/uploads/players/siddharth-iyer.jpg",
+      },
+      meera && {
+        auctionId: seededAuctionId,
+        userId: meera.id,
+        playerName: meera.name,
+        rollNumber: meera.rollNumber || "ME25B1018",
+        yearLabel: "1st Year",
+        branch: meera.branch,
+        sport: "Badminton",
+        positionsJson: JSON.stringify(["Singles", "Doubles"]),
+        playerClass: "CLUB",
+        basePrice: 6000,
+        tier: "TIER_1",
+        roundId: firstRoundId,
+        status: "ELIGIBLE",
+        soldToFranchiseId: null,
+        soldPrice: null,
+        statsSummary: "Inter-batch Indoor Singles Finalist",
+        photoUrl: "/uploads/players/meera-krishnan.jpg",
+      },
+      ananya && {
+        auctionId: seededAuctionId,
+        userId: ananya.id,
+        playerName: ananya.name,
+        rollNumber: ananya.rollNumber || "EC25B1033",
+        yearLabel: "1st Year",
+        branch: ananya.branch,
+        sport: "Cricket",
+        positionsJson: JSON.stringify(["Batsman"]),
+        playerClass: "NON_CLUB",
+        basePrice: 5000,
+        tier: "UNCAPPED",
+        roundId: firstRoundId,
+        status: "ELIGIBLE",
+        soldToFranchiseId: null,
+        soldPrice: null,
+        statsSummary: "Inter-hostel standout opener",
+        photoUrl: "/uploads/players/ananya-reddy.jpg",
+      },
+      meera && {
+        auctionId: seededAuctionId,
+        userId: meera.id,
+        playerName: meera.name,
+        rollNumber: meera.rollNumber || "ME25B1018",
+        yearLabel: "1st Year",
+        branch: meera.branch,
+        sport: "Cricket",
+        positionsJson: JSON.stringify(["Bowler", "All-Rounder"]),
+        playerClass: "CLUB",
+        basePrice: 10000,
+        tier: "TIER_1",
+        roundId: firstRoundId,
+        status: "SOLD",
+        soldToFranchiseId: cricketTitansId,
+        soldPrice: 22000,
+        statsSummary: "2026 Inter-Batch Emerging All-Rounder",
+        photoUrl: "/uploads/players/meera-krishnan.jpg",
+      },
+      arjun && {
+        auctionId: seededAuctionId,
+        userId: arjun.id,
+        playerName: arjun.name,
+        rollNumber: arjun.rollNumber || "CS23B1019",
+        yearLabel: "3rd Year",
+        branch: arjun.branch,
+        sport: "Football",
+        positionsJson: JSON.stringify(["Midfielder", "Defender"]),
+        playerClass: "CLUB",
+        basePrice: 8000,
+        tier: "TIER_1",
+        roundId: firstRoundId,
+        status: "SOLD",
+        soldToFranchiseId: footballKaveriId,
+        soldPrice: 16000,
+        statsSummary: "2026 Inter-Batch Defensive Midfielder of the Meet",
+        photoUrl: "/uploads/players/siddharth-iyer.jpg",
+      },
+    ].filter((r): r is NonNullable<typeof r> => Boolean(r));
+
+    if (rows.length > 0) {
+      await db.insert(auctionRegistrations).values(rows);
     }
   }
 

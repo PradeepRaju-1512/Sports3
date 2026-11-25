@@ -1,6 +1,8 @@
 import "dotenv/config";
 import express, { type Response } from "express";
 import cors from "cors";
+import fs from "fs/promises";
+import crypto from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
 import { asc, desc, eq, and, inArray, ne } from "drizzle-orm";
@@ -16,25 +18,302 @@ import {
   tournamentTeams,
   teamRosterMembers,
   tournamentMatches,
+  auctions,
+  auctionRounds,
+  auctionFranchises,
+  auctionRegistrations,
 } from "../db/schema.js";
 import {
   demoStore,
   auctionState,
   buildLiveAuctionSnapshot,
   computeFranchiseSummaries,
+  getEffectiveBasePrice,
+  DEFAULT_POSITIONS_BY_SPORT,
+  type RawFranchise,
 } from "./demoStore.js";
 import type {
   AuctionConfig,
   AuctionPlayerStatus,
+  AuctionRegistration,
+  AuctionRound,
   AuctionStatus,
+  PlayerClass,
+  SportBasePriceOverride,
 } from "../types/auction.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const UPLOADS_ROOT = path.resolve(process.cwd(), "public/uploads");
+const PLAYER_UPLOADS_DIR = path.join(UPLOADS_ROOT, "players");
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "8mb" }));
+app.use("/uploads", express.static(UPLOADS_ROOT));
+
+async function saveValidatedPlayerPhoto(
+  rawPhoto?: unknown
+): Promise<string | null> {
+  if (typeof rawPhoto !== "string") return null;
+  const trimmed = rawPhoto.trim();
+  if (!trimmed) return null;
+
+  // Allow safe relative asset paths or HTTPS URLs
+  if (
+    trimmed.startsWith("/uploads/") ||
+    trimmed.startsWith("/images/") ||
+    /^https:\/\/[^\s"'<>]+$/i.test(trimmed)
+  ) {
+    return trimmed.slice(0, 512);
+  }
+
+  // Validate and persist safe raster base64 image data URLs (PNG/JPEG/WebP/GIF only; no SVG)
+  const match = trimmed.match(
+    /^data:image\/(png|jpeg|jpg|webp|gif);base64,([A-Za-z0-9+/=\s]+)$/i
+  );
+  if (!match) {
+    throw new Error(
+      "Unsupported photo format. Please upload a PNG, JPG, WebP, or GIF image."
+    );
+  }
+
+  const ext = match[1].toLowerCase() === "jpeg" ? "jpg" : match[1].toLowerCase();
+  const buffer = Buffer.from(match[2].replace(/\s+/g, ""), "base64");
+  const maxBytes = 5 * 1024 * 1024;
+  if (buffer.length === 0 || buffer.length > maxBytes) {
+    throw new Error("Photo must be under 5 MB.");
+  }
+
+  try {
+    await fs.mkdir(PLAYER_UPLOADS_DIR, { recursive: true });
+    const filename = `player-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${ext}`;
+    await fs.writeFile(path.join(PLAYER_UPLOADS_DIR, filename), buffer);
+    return `/uploads/players/${filename}`;
+  } catch {
+    // Fallback to validated data URL if filesystem is read-only
+    return trimmed;
+  }
+}
+
+function safeParseJson<T>(raw: string | null | undefined, fallback: T): T {
+  if (!raw) return fallback;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+async function persistAuctionConfigToDb() {
+  if (!useDb || !db) return;
+  try {
+    const cfg = auctionState.auction;
+    await db
+      .update(auctions)
+      .set({
+        name: cfg.name,
+        seasonYear: cfg.seasonYear,
+        sportsJson: JSON.stringify(cfg.sports),
+        status: cfg.status,
+        registrationDeadline: cfg.registrationDeadline,
+        clubBasePrice: cfg.clubBasePrice,
+        nonClubBasePrice: cfg.nonClubBasePrice,
+        sportBasePricesJson: JSON.stringify(cfg.sportBasePrices || {}),
+        defaultIncrement: cfg.defaultIncrement,
+        jumpIncrement: cfg.jumpIncrement,
+        minSquadSize: cfg.minSquadSize,
+        maxSquadSize: cfg.maxSquadSize,
+        minClubPlayers: cfg.minClubPlayers,
+        minNonClubPlayers: cfg.minNonClubPlayers,
+        playerTiersJson: JSON.stringify(cfg.playerTiers || []),
+        positionsBySportJson: JSON.stringify(
+          cfg.positionsBySport || DEFAULT_POSITIONS_BY_SPORT
+        ),
+        activeRoundId: cfg.activeRoundId,
+        activeSport: cfg.activeSport,
+        currentPlayerId: cfg.currentPlayerId,
+        projectorMode: cfg.projectorMode,
+        updatedAt: new Date(),
+      })
+      .where(eq(auctions.id, cfg.id));
+  } catch {
+    // Table may not be pushed yet; keep in-memory state running smoothly
+  }
+}
+
+async function hydrateAuctionFromDb() {
+  if (!useDb || !db) return;
+  try {
+    const [dbAuction] = await db
+      .select()
+      .from(auctions)
+      .orderBy(asc(auctions.id))
+      .limit(1);
+    if (dbAuction) {
+      const parsedSports = safeParseJson<string[]>(
+        dbAuction.sportsJson,
+        auctionState.auction.sports
+      );
+      const parsedSportBasePrices = safeParseJson<
+        Record<string, SportBasePriceOverride>
+      >(dbAuction.sportBasePricesJson, auctionState.auction.sportBasePrices);
+      const parsedTiers = safeParseJson<string[]>(
+        dbAuction.playerTiersJson,
+        auctionState.auction.playerTiers
+      );
+      const parsedPositions = safeParseJson<Record<string, string[]>>(
+        dbAuction.positionsBySportJson,
+        DEFAULT_POSITIONS_BY_SPORT
+      );
+
+      auctionState.auction = {
+        id: dbAuction.id,
+        name: dbAuction.name,
+        seasonYear: dbAuction.seasonYear,
+        sports:
+          Array.isArray(parsedSports) && parsedSports.length > 0
+            ? parsedSports
+            : auctionState.auction.sports,
+        status: (dbAuction.status as AuctionStatus) || "REGISTRATION_OPEN",
+        registrationDeadline: dbAuction.registrationDeadline,
+        clubBasePrice: dbAuction.clubBasePrice,
+        nonClubBasePrice: dbAuction.nonClubBasePrice,
+        sportBasePrices:
+          parsedSportBasePrices && typeof parsedSportBasePrices === "object"
+            ? parsedSportBasePrices
+            : {},
+        defaultIncrement: dbAuction.defaultIncrement,
+        jumpIncrement: dbAuction.jumpIncrement,
+        minSquadSize: dbAuction.minSquadSize,
+        maxSquadSize: dbAuction.maxSquadSize,
+        minClubPlayers: dbAuction.minClubPlayers,
+        minNonClubPlayers: dbAuction.minNonClubPlayers,
+        playerTiers:
+          Array.isArray(parsedTiers) && parsedTiers.length > 0
+            ? parsedTiers
+            : ["MARQUEE", "TIER_1", "TIER_2", "UNCAPPED"],
+        positionsBySport:
+          parsedPositions && typeof parsedPositions === "object"
+            ? { ...DEFAULT_POSITIONS_BY_SPORT, ...parsedPositions }
+            : { ...DEFAULT_POSITIONS_BY_SPORT },
+        activeRoundId: dbAuction.activeRoundId ?? 1,
+        activeSport: dbAuction.activeSport || "Cricket",
+        currentPlayerId: dbAuction.currentPlayerId ?? null,
+        projectorMode:
+          (dbAuction.projectorMode as AuctionConfig["projectorMode"]) ||
+          "STAGE",
+        lastUpdatedAt: new Date().toLocaleTimeString(),
+      };
+    }
+  } catch {
+    // auctions table may not be pushed yet
+  }
+
+  try {
+    const dbRounds = await db
+      .select()
+      .from(auctionRounds)
+      .orderBy(asc(auctionRounds.roundNumber), asc(auctionRounds.id));
+    if (dbRounds.length > 0) {
+      auctionState.rounds = dbRounds.map((r) => ({
+        id: r.id,
+        auctionId: r.auctionId,
+        roundNumber: r.roundNumber,
+        name: r.name,
+        status: (r.status as AuctionRound["status"]) || "PENDING",
+      }));
+      const activeRound =
+        auctionState.rounds.find((r) => r.status === "ACTIVE") ||
+        auctionState.rounds[0];
+      if (activeRound) auctionState.auction.activeRoundId = activeRound.id;
+    }
+  } catch {
+    // auction_rounds table may not be pushed yet
+  }
+
+  try {
+    const dbFranchises = await db
+      .select()
+      .from(auctionFranchises)
+      .orderBy(
+        asc(auctionFranchises.sport),
+        asc(auctionFranchises.slotNumber),
+        asc(auctionFranchises.id)
+      );
+    if (dbFranchises.length > 0) {
+      auctionState.franchises = dbFranchises.map((f) => ({
+        id: f.id,
+        auctionId: f.auctionId,
+        sport: f.sport,
+        slotNumber: f.slotNumber,
+        name: f.name,
+        shortCode: f.shortCode,
+        accentColor: f.accentColor,
+        captainName: f.captainName,
+        startingPurse: f.startingPurse,
+        minSquadSize: f.minSquadSize,
+        maxSquadSize: f.maxSquadSize,
+        minClubPlayers: f.minClubPlayers,
+        minNonClubPlayers: f.minNonClubPlayers,
+      }));
+    }
+  } catch {
+    // auction_franchises table may not be pushed yet
+  }
+
+  try {
+    const rows = await db
+      .select()
+      .from(auctionRegistrations)
+      .orderBy(asc(auctionRegistrations.id));
+    if (rows.length > 0) {
+      auctionState.registrations = rows.map((r) => {
+        let positions: string[] = ["Player"];
+        try {
+          const parsed = JSON.parse(r.positionsJson);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            positions = parsed.map(String);
+          }
+        } catch {
+          positions = ["Player"];
+        }
+        return {
+          id: r.id,
+          auctionId: r.auctionId,
+          userId: r.userId,
+          playerName: r.playerName,
+          rollNumber: r.rollNumber,
+          yearLabel: r.yearLabel,
+          branch: r.branch,
+          sport: r.sport,
+          positions,
+          playerClass: (r.playerClass === "CLUB"
+            ? "CLUB"
+            : "NON_CLUB") as PlayerClass,
+          basePrice: r.basePrice,
+          tier: r.tier || "UNCAPPED",
+          roundId: r.roundId,
+          status: (r.status as AuctionPlayerStatus) || "ELIGIBLE",
+          soldToFranchiseId: r.soldToFranchiseId ?? null,
+          soldPrice: r.soldPrice ?? null,
+          statsSummary: r.statsSummary,
+          photoUrl: r.photoUrl ?? null,
+        };
+      });
+      const current = auctionState.registrations.find(
+        (r) => r.status === "IN_AUCTION"
+      );
+      if (current) {
+        auctionState.auction.currentPlayerId = current.id;
+        auctionState.auction.activeSport = current.sport;
+      }
+    }
+  } catch {
+    // Table may not be pushed yet; continue smoothly with seeded auctionState
+  }
+}
 
 // In hosted container environments with an upstream nginx proxy (NGINX_PORT === PORT),
 // bind the app server to DEFAULT_APP_PORT (3000). Locally or on standalone hosts, honor PORT.
@@ -70,9 +349,12 @@ function isMatchScorer(role: string): boolean {
 }
 
 function canOperateAuction(role: string): boolean {
-  return ["AUCTION_OPERATOR", "SPORTS_SECRETARY", "FACULTY_ADVISOR"].includes(
-    role
-  );
+  return [
+    "AUCTION_OPERATOR",
+    "AUCTIONEER",
+    "SPORTS_SECRETARY",
+    "FACULTY_ADVISOR",
+  ].includes(role);
 }
 
 async function getUserById(id: number) {
@@ -1040,8 +1322,11 @@ app.get("/api/auction", async (req, res) => {
       : ["Cricket", "Football"];
     res.json({
       auction: auctionState.auction,
-      rounds: auctionState.rounds,
+      rounds: [...auctionState.rounds].sort(
+        (a, b) => a.roundNumber - b.roundNumber || a.id - b.id
+      ),
       registrations: auctionState.registrations,
+      franchises: computeFranchiseSummaries(),
       inductedSports,
     });
   } catch (err) {
@@ -1049,10 +1334,866 @@ app.get("/api/auction", async (req, res) => {
   }
 });
 
+app.patch("/api/auction/config", async (req, res) => {
+  try {
+    const {
+      actorUserId,
+      name,
+      seasonYear,
+      sports,
+      status,
+      registrationDeadline,
+      clubBasePrice,
+      nonClubBasePrice,
+      sportBasePrices,
+      defaultIncrement,
+      jumpIncrement,
+      minSquadSize,
+      maxSquadSize,
+      minClubPlayers,
+      minNonClubPlayers,
+      playerTiers,
+      positionsBySport,
+    } = req.body;
+
+    const actor = await getUserById(Number(actorUserId));
+    if (!actor || !canOperateAuction(actor.role)) {
+      return res.status(403).json({
+        error:
+          "Only Sports Secretary, Faculty Advisor, or Auction Operator can update auction settings.",
+      });
+    }
+
+    const admin = isSportsAdmin(actor.role);
+    const adminOnlyFieldsProvided =
+      name !== undefined ||
+      seasonYear !== undefined ||
+      sports !== undefined ||
+      status !== undefined ||
+      registrationDeadline !== undefined ||
+      clubBasePrice !== undefined ||
+      nonClubBasePrice !== undefined ||
+      sportBasePrices !== undefined ||
+      minSquadSize !== undefined ||
+      maxSquadSize !== undefined ||
+      minClubPlayers !== undefined ||
+      minNonClubPlayers !== undefined ||
+      playerTiers !== undefined ||
+      positionsBySport !== undefined;
+
+    if (!admin && adminOnlyFieldsProvided) {
+      return res.status(403).json({
+        error:
+          "Auction Operators may adjust bid increments live; global rules require Sports Secretary or Faculty Advisor access.",
+      });
+    }
+
+    const cfg = auctionState.auction;
+
+    const nextClubBase =
+      clubBasePrice !== undefined ? Number(clubBasePrice) : cfg.clubBasePrice;
+    const nextNonClubBase =
+      nonClubBasePrice !== undefined
+        ? Number(nonClubBasePrice)
+        : cfg.nonClubBasePrice;
+    const nextDefaultInc =
+      defaultIncrement !== undefined
+        ? Number(defaultIncrement)
+        : cfg.defaultIncrement;
+    const nextJumpInc =
+      jumpIncrement !== undefined ? Number(jumpIncrement) : cfg.jumpIncrement;
+    const nextMinSquad =
+      minSquadSize !== undefined ? Number(minSquadSize) : cfg.minSquadSize;
+    const nextMaxSquad =
+      maxSquadSize !== undefined ? Number(maxSquadSize) : cfg.maxSquadSize;
+    const nextMinClub =
+      minClubPlayers !== undefined
+        ? Number(minClubPlayers)
+        : cfg.minClubPlayers;
+    const nextMinNonClub =
+      minNonClubPlayers !== undefined
+        ? Number(minNonClubPlayers)
+        : cfg.minNonClubPlayers;
+
+    if (
+      !Number.isFinite(nextClubBase) ||
+      nextClubBase < 0 ||
+      !Number.isFinite(nextNonClubBase) ||
+      nextNonClubBase < 0
+    ) {
+      return res
+        .status(400)
+        .json({ error: "Base prices must be non-negative numbers." });
+    }
+    if (
+      !Number.isFinite(nextDefaultInc) ||
+      nextDefaultInc <= 0 ||
+      !Number.isFinite(nextJumpInc) ||
+      nextJumpInc < nextDefaultInc
+    ) {
+      return res.status(400).json({
+        error:
+          "Default increment must be > 0 and jump increment must be >= default increment.",
+      });
+    }
+    if (
+      !Number.isFinite(nextMinSquad) ||
+      !Number.isFinite(nextMaxSquad) ||
+      nextMinSquad < 1 ||
+      nextMaxSquad < nextMinSquad
+    ) {
+      return res.status(400).json({
+        error: "Min squad size must be >= 1 and <= max squad size.",
+      });
+    }
+    if (
+      !Number.isFinite(nextMinClub) ||
+      !Number.isFinite(nextMinNonClub) ||
+      nextMinClub < 0 ||
+      nextMinNonClub < 0 ||
+      nextMinClub + nextMinNonClub > nextMaxSquad
+    ) {
+      return res.status(400).json({
+        error:
+          "CLUB + NON_CLUB minimum quotas must be >= 0 and cannot exceed max squad size.",
+      });
+    }
+
+    let nextSportBasePrices = cfg.sportBasePrices;
+    if (sportBasePrices !== undefined) {
+      if (
+        typeof sportBasePrices !== "object" ||
+        sportBasePrices === null ||
+        Array.isArray(sportBasePrices)
+      ) {
+        return res
+          .status(400)
+          .json({ error: "sportBasePrices must be an object map." });
+      }
+      const cleaned: Record<string, SportBasePriceOverride> = {};
+      for (const [sportKey, val] of Object.entries(sportBasePrices)) {
+        if (!val || typeof val !== "object") continue;
+        const v = val as Partial<SportBasePriceOverride>;
+        const cb = Number(v.clubBasePrice);
+        const ncb = Number(v.nonClubBasePrice);
+        if (!Number.isFinite(cb) || cb < 0 || !Number.isFinite(ncb) || ncb < 0) {
+          return res.status(400).json({
+            error: `Invalid sport base prices for ${sportKey}.`,
+          });
+        }
+        cleaned[sportKey.trim()] = {
+          clubBasePrice: Math.round(cb),
+          nonClubBasePrice: Math.round(ncb),
+        };
+      }
+      nextSportBasePrices = cleaned;
+    }
+
+    const pricingChanged =
+      nextClubBase !== cfg.clubBasePrice ||
+      nextNonClubBase !== cfg.nonClubBasePrice ||
+      sportBasePrices !== undefined;
+
+    if (name !== undefined && String(name).trim()) {
+      cfg.name = String(name).trim();
+    }
+    if (seasonYear !== undefined && Number.isFinite(Number(seasonYear))) {
+      cfg.seasonYear = Number(seasonYear);
+    }
+    if (Array.isArray(sports) && sports.length > 0) {
+      cfg.sports = sports.map((s) => String(s).trim()).filter(Boolean);
+    }
+    if (status !== undefined) {
+      const allowedStatuses: AuctionStatus[] = [
+        "DRAFT",
+        "REGISTRATION_OPEN",
+        "FROZEN",
+        "LIVE",
+        "COMPLETED",
+        "PUBLISHED",
+      ];
+      if (!allowedStatuses.includes(status)) {
+        return res.status(400).json({ error: "Invalid auction status." });
+      }
+      cfg.status = status;
+    }
+    if (registrationDeadline !== undefined) {
+      cfg.registrationDeadline = String(registrationDeadline).trim();
+    }
+    cfg.clubBasePrice = Math.round(nextClubBase);
+    cfg.nonClubBasePrice = Math.round(nextNonClubBase);
+    cfg.sportBasePrices = nextSportBasePrices;
+    cfg.defaultIncrement = Math.round(nextDefaultInc);
+    cfg.jumpIncrement = Math.round(nextJumpInc);
+    cfg.minSquadSize = Math.round(nextMinSquad);
+    cfg.maxSquadSize = Math.round(nextMaxSquad);
+    cfg.minClubPlayers = Math.round(nextMinClub);
+    cfg.minNonClubPlayers = Math.round(nextMinNonClub);
+
+    if (Array.isArray(playerTiers) && playerTiers.length > 0) {
+      cfg.playerTiers = playerTiers
+        .map((t) => String(t).trim())
+        .filter(Boolean);
+    }
+    if (
+      positionsBySport &&
+      typeof positionsBySport === "object" &&
+      !Array.isArray(positionsBySport)
+    ) {
+      const cleanedPos: Record<string, string[]> = {};
+      for (const [sp, list] of Object.entries(positionsBySport)) {
+        if (Array.isArray(list)) {
+          const valid = list.map((p) => String(p).trim()).filter(Boolean);
+          if (valid.length > 0) cleanedPos[sp.trim()] = valid;
+        }
+      }
+      if (Object.keys(cleanedPos).length > 0) {
+        cfg.positionsBySport = cleanedPos;
+      }
+    }
+
+    if (pricingChanged) {
+      const mutableStatuses: AuctionPlayerStatus[] = [
+        "REGISTERED",
+        "ELIGIBLE",
+        "UNSOLD",
+        "RE_AUCTIONED",
+      ];
+      for (const reg of auctionState.registrations) {
+        if (mutableStatuses.includes(reg.status)) {
+          reg.basePrice = getEffectiveBasePrice(cfg, reg.sport, reg.playerClass);
+          if (useDb && db) {
+            try {
+              await db
+                .update(auctionRegistrations)
+                .set({ basePrice: reg.basePrice })
+                .where(eq(auctionRegistrations.id, reg.id));
+            } catch {
+              // Ignore if table not pushed
+            }
+          }
+        }
+      }
+    }
+
+    await persistAuctionConfigToDb();
+    broadcastAuctionSnapshot();
+    res.json({
+      auction: cfg,
+      registrations: auctionState.registrations,
+      franchises: computeFranchiseSummaries(),
+    });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+app.post("/api/auction/rounds", async (req, res) => {
+  try {
+    const { actorUserId, name, roundNumber, status } = req.body;
+    const actor = await getUserById(Number(actorUserId));
+    if (!actor || !isSportsAdmin(actor.role)) {
+      return res.status(403).json({
+        error: "Only Sports Secretary or Faculty Advisor can add auction rounds.",
+      });
+    }
+
+    const cleanName = String(name || "").trim();
+    if (!cleanName) {
+      return res.status(400).json({ error: "Round name is required." });
+    }
+
+    const nextNum =
+      Number.isFinite(Number(roundNumber)) && Number(roundNumber) > 0
+        ? Math.round(Number(roundNumber))
+        : auctionState.rounds.reduce(
+            (max, r) => Math.max(max, r.roundNumber),
+            0
+          ) + 1;
+
+    const cleanStatus: AuctionRound["status"] =
+      status === "ACTIVE" || status === "COMPLETED" ? status : "PENDING";
+
+    if (cleanStatus === "ACTIVE") {
+      auctionState.rounds.forEach((r) => {
+        if (r.status === "ACTIVE") r.status = "COMPLETED";
+      });
+    }
+
+    let nextId =
+      auctionState.rounds.reduce((max, r) => Math.max(max, r.id), 0) + 1;
+
+    if (useDb && db) {
+      try {
+        const [inserted] = await db
+          .insert(auctionRounds)
+          .values({
+            auctionId: auctionState.auction.id,
+            roundNumber: nextNum,
+            name: cleanName,
+            status: cleanStatus,
+          })
+          .returning();
+        if (inserted) nextId = inserted.id;
+      } catch {
+        // Ignore if table not pushed
+      }
+    }
+
+    const created: AuctionRound = {
+      id: nextId,
+      auctionId: auctionState.auction.id,
+      roundNumber: nextNum,
+      name: cleanName,
+      status: cleanStatus,
+    };
+    auctionState.rounds.push(created);
+
+    if (cleanStatus === "ACTIVE") {
+      auctionState.auction.activeRoundId = created.id;
+      await persistAuctionConfigToDb();
+    }
+
+    broadcastAuctionSnapshot();
+    res.status(201).json({
+      round: created,
+      rounds: [...auctionState.rounds].sort(
+        (a, b) => a.roundNumber - b.roundNumber || a.id - b.id
+      ),
+    });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+app.patch("/api/auction/rounds/:id", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { actorUserId, name, roundNumber, status, moveUnsoldHere, sport } =
+      req.body;
+    const actor = await getUserById(Number(actorUserId));
+    if (!actor || !canOperateAuction(actor.role)) {
+      return res.status(403).json({ error: "Not authorized to edit rounds." });
+    }
+    if (
+      !isSportsAdmin(actor.role) &&
+      (name !== undefined || roundNumber !== undefined)
+    ) {
+      return res.status(403).json({
+        error: "Only Sports Secretary or Faculty Advisor can rename or reorder rounds.",
+      });
+    }
+
+    const target = auctionState.rounds.find((r) => r.id === id);
+    if (!target) return res.status(404).json({ error: "Round not found." });
+
+    if (name !== undefined && String(name).trim()) {
+      target.name = String(name).trim();
+    }
+    if (roundNumber !== undefined && Number(roundNumber) > 0) {
+      target.roundNumber = Math.round(Number(roundNumber));
+    }
+    if (status === "PENDING" || status === "ACTIVE" || status === "COMPLETED") {
+      if (status === "ACTIVE") {
+        for (const r of auctionState.rounds) {
+          if (r.id !== target.id && r.status === "ACTIVE") {
+            r.status = "COMPLETED";
+            if (useDb && db) {
+              try {
+                await db
+                  .update(auctionRounds)
+                  .set({ status: "COMPLETED" })
+                  .where(eq(auctionRounds.id, r.id));
+              } catch {
+                // Ignore
+              }
+            }
+          }
+        }
+        auctionState.auction.activeRoundId = target.id;
+      }
+      target.status = status;
+    }
+
+    let movedCount = 0;
+    if (moveUnsoldHere) {
+      const sportFilter = sport ? String(sport).toLowerCase() : null;
+      for (const reg of auctionState.registrations) {
+        if (
+          reg.status === "UNSOLD" &&
+          (!sportFilter || reg.sport.toLowerCase() === sportFilter)
+        ) {
+          reg.roundId = target.id;
+          reg.status = "RE_AUCTIONED";
+          movedCount += 1;
+          if (useDb && db) {
+            try {
+              await db
+                .update(auctionRegistrations)
+                .set({ roundId: target.id, status: "RE_AUCTIONED" })
+                .where(eq(auctionRegistrations.id, reg.id));
+            } catch {
+              // Ignore
+            }
+          }
+        }
+      }
+    }
+
+    if (useDb && db) {
+      try {
+        await db
+          .update(auctionRounds)
+          .set({
+            name: target.name,
+            roundNumber: target.roundNumber,
+            status: target.status,
+          })
+          .where(eq(auctionRounds.id, target.id));
+      } catch {
+        // Ignore
+      }
+    }
+
+    await persistAuctionConfigToDb();
+    broadcastAuctionSnapshot();
+    res.json({
+      round: target,
+      movedCount,
+      rounds: [...auctionState.rounds].sort(
+        (a, b) => a.roundNumber - b.roundNumber || a.id - b.id
+      ),
+    });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+app.delete("/api/auction/rounds/:id", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const actorUserId = Number(req.body?.actorUserId ?? req.query.actorUserId);
+    const actor = await getUserById(actorUserId);
+    if (!actor || !isSportsAdmin(actor.role)) {
+      return res.status(403).json({
+        error: "Only Sports Secretary or Faculty Advisor can delete rounds.",
+      });
+    }
+
+    if (auctionState.rounds.length <= 1) {
+      return res
+        .status(400)
+        .json({ error: "Cannot delete the last remaining auction round." });
+    }
+
+    const idx = auctionState.rounds.findIndex((r) => r.id === id);
+    if (idx === -1) return res.status(404).json({ error: "Round not found." });
+
+    const target = auctionState.rounds[idx];
+    if (
+      target.status === "ACTIVE" ||
+      auctionState.auction.activeRoundId === target.id
+    ) {
+      return res.status(400).json({
+        error: "Activate a different round before deleting the active round.",
+      });
+    }
+
+    auctionState.rounds.splice(idx, 1);
+    const fallbackRoundId =
+      auctionState.auction.activeRoundId || auctionState.rounds[0].id;
+
+    for (const reg of auctionState.registrations) {
+      if (reg.roundId === id) {
+        reg.roundId = fallbackRoundId;
+        if (useDb && db) {
+          try {
+            await db
+              .update(auctionRegistrations)
+              .set({ roundId: fallbackRoundId })
+              .where(eq(auctionRegistrations.id, reg.id));
+          } catch {
+            // Ignore
+          }
+        }
+      }
+    }
+
+    if (useDb && db) {
+      try {
+        await db.delete(auctionRounds).where(eq(auctionRounds.id, id));
+      } catch {
+        // Ignore
+      }
+    }
+
+    broadcastAuctionSnapshot();
+    res.json({
+      deletedId: id,
+      rounds: [...auctionState.rounds].sort(
+        (a, b) => a.roundNumber - b.roundNumber || a.id - b.id
+      ),
+    });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+app.post("/api/auction/franchises", async (req, res) => {
+  try {
+    const {
+      actorUserId,
+      sport,
+      name,
+      shortCode,
+      accentColor,
+      captainName,
+      startingPurse,
+      slotNumber,
+      minSquadSize,
+      maxSquadSize,
+      minClubPlayers,
+      minNonClubPlayers,
+    } = req.body;
+
+    const actor = await getUserById(Number(actorUserId));
+    if (!actor || !isSportsAdmin(actor.role)) {
+      return res.status(403).json({
+        error: "Only Sports Secretary or Faculty Advisor can add franchises.",
+      });
+    }
+
+    const cleanSport = String(sport || "").trim();
+    const cleanName = String(name || "").trim();
+    const parsedPurse = Number(startingPurse);
+
+    if (!cleanSport || !cleanName) {
+      return res
+        .status(400)
+        .json({ error: "Sport and franchise name are required." });
+    }
+    if (!Number.isFinite(parsedPurse) || parsedPurse < 0) {
+      return res
+        .status(400)
+        .json({ error: "Starting purse must be a non-negative number." });
+    }
+
+    const sameSportFranchises = auctionState.franchises.filter(
+      (f) => f.sport.toLowerCase() === cleanSport.toLowerCase()
+    );
+    const resolvedSlot =
+      Number.isFinite(Number(slotNumber)) && Number(slotNumber) >= 1
+        ? Math.round(Number(slotNumber))
+        : sameSportFranchises.reduce(
+            (max, f) => Math.max(max, f.slotNumber),
+            0
+          ) + 1;
+
+    const resolvedShortCode =
+      String(shortCode || "")
+        .trim()
+        .toUpperCase()
+        .slice(0, 4) ||
+      cleanName
+        .split(/\s+/)
+        .map((w) => w[0])
+        .join("")
+        .toUpperCase()
+        .slice(0, 3) ||
+      "TM";
+
+    const resolvedColor = /^#[0-9a-fA-F]{6}$/.test(String(accentColor || ""))
+      ? String(accentColor)
+      : "#d4a038";
+
+    let nextId =
+      auctionState.franchises.reduce((max, f) => Math.max(max, f.id), 0) + 1;
+
+    const payload: Omit<RawFranchise, "id"> = {
+      auctionId: auctionState.auction.id,
+      sport: cleanSport,
+      slotNumber: resolvedSlot,
+      name: cleanName,
+      shortCode: resolvedShortCode,
+      accentColor: resolvedColor,
+      captainName: String(captainName || "").trim(),
+      startingPurse: Math.round(parsedPurse),
+      minSquadSize:
+        minSquadSize !== undefined && minSquadSize !== "" && minSquadSize !== null
+          ? Number(minSquadSize)
+          : null,
+      maxSquadSize:
+        maxSquadSize !== undefined && maxSquadSize !== "" && maxSquadSize !== null
+          ? Number(maxSquadSize)
+          : null,
+      minClubPlayers:
+        minClubPlayers !== undefined &&
+        minClubPlayers !== "" &&
+        minClubPlayers !== null
+          ? Number(minClubPlayers)
+          : null,
+      minNonClubPlayers:
+        minNonClubPlayers !== undefined &&
+        minNonClubPlayers !== "" &&
+        minNonClubPlayers !== null
+          ? Number(minNonClubPlayers)
+          : null,
+    };
+
+    if (useDb && db) {
+      try {
+        const [inserted] = await db
+          .insert(auctionFranchises)
+          .values(payload)
+          .returning();
+        if (inserted) nextId = inserted.id;
+      } catch {
+        // Ignore if table not pushed
+      }
+    }
+
+    const created: RawFranchise = { id: nextId, ...payload };
+    auctionState.franchises.push(created);
+
+    if (
+      !auctionState.auction.sports.some(
+        (s) => s.toLowerCase() === cleanSport.toLowerCase()
+      )
+    ) {
+      auctionState.auction.sports.push(cleanSport);
+      await persistAuctionConfigToDb();
+    }
+
+    broadcastAuctionSnapshot();
+    const summaries = computeFranchiseSummaries();
+    res.status(201).json({
+      franchise: summaries.find((f) => f.id === created.id) || created,
+      franchises: summaries,
+    });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+app.patch("/api/auction/franchises/:id", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const {
+      actorUserId,
+      sport,
+      name,
+      shortCode,
+      accentColor,
+      captainName,
+      startingPurse,
+      slotNumber,
+      minSquadSize,
+      maxSquadSize,
+      minClubPlayers,
+      minNonClubPlayers,
+    } = req.body;
+
+    const actor = await getUserById(Number(actorUserId));
+    if (!actor || !canOperateAuction(actor.role)) {
+      return res
+        .status(403)
+        .json({ error: "Not authorized to edit franchise settings." });
+    }
+
+    const admin = isSportsAdmin(actor.role);
+    const nonPurseFields =
+      sport !== undefined ||
+      name !== undefined ||
+      shortCode !== undefined ||
+      accentColor !== undefined ||
+      captainName !== undefined ||
+      slotNumber !== undefined ||
+      minSquadSize !== undefined ||
+      maxSquadSize !== undefined ||
+      minClubPlayers !== undefined ||
+      minNonClubPlayers !== undefined;
+
+    if (!admin && nonPurseFields) {
+      return res.status(403).json({
+        error:
+          "Auction Operators may adjust starting purse live; full franchise edits require Sports Secretary or Faculty Advisor access.",
+      });
+    }
+
+    const target = auctionState.franchises.find((f) => f.id === id);
+    if (!target) {
+      return res.status(404).json({ error: "Franchise not found." });
+    }
+
+    const ownedPlayers = auctionState.registrations.filter(
+      (r) => r.status === "SOLD" && r.soldToFranchiseId === target.id
+    );
+    const spentPurse = ownedPlayers.reduce(
+      (acc, r) => acc + (r.soldPrice || 0),
+      0
+    );
+
+    if (
+      sport !== undefined &&
+      String(sport).trim().toLowerCase() !== target.sport.toLowerCase()
+    ) {
+      if (ownedPlayers.length > 0) {
+        return res.status(400).json({
+          error:
+            "Cannot change a franchise's sport after it has already purchased players.",
+        });
+      }
+      target.sport = String(sport).trim();
+    }
+
+    if (startingPurse !== undefined) {
+      const nextPurse = Number(startingPurse);
+      if (!Number.isFinite(nextPurse) || nextPurse < 0) {
+        return res
+          .status(400)
+          .json({ error: "Starting purse must be a non-negative number." });
+      }
+      if (nextPurse < spentPurse) {
+        return res.status(400).json({
+          error: `Starting purse (₹${nextPurse.toLocaleString()}) cannot be lower than already spent amount (₹${spentPurse.toLocaleString()}).`,
+        });
+      }
+      target.startingPurse = Math.round(nextPurse);
+    }
+
+    if (name !== undefined && String(name).trim()) {
+      target.name = String(name).trim();
+    }
+    if (shortCode !== undefined && String(shortCode).trim()) {
+      target.shortCode = String(shortCode).trim().toUpperCase().slice(0, 4);
+    }
+    if (
+      accentColor !== undefined &&
+      /^#[0-9a-fA-F]{6}$/.test(String(accentColor))
+    ) {
+      target.accentColor = String(accentColor);
+    }
+    if (captainName !== undefined) {
+      target.captainName = String(captainName).trim();
+    }
+    if (slotNumber !== undefined && Number(slotNumber) >= 1) {
+      target.slotNumber = Math.round(Number(slotNumber));
+    }
+    if (minSquadSize !== undefined) {
+      target.minSquadSize =
+        minSquadSize === "" || minSquadSize === null
+          ? null
+          : Number(minSquadSize);
+    }
+    if (maxSquadSize !== undefined) {
+      target.maxSquadSize =
+        maxSquadSize === "" || maxSquadSize === null
+          ? null
+          : Number(maxSquadSize);
+    }
+    if (minClubPlayers !== undefined) {
+      target.minClubPlayers =
+        minClubPlayers === "" || minClubPlayers === null
+          ? null
+          : Number(minClubPlayers);
+    }
+    if (minNonClubPlayers !== undefined) {
+      target.minNonClubPlayers =
+        minNonClubPlayers === "" || minNonClubPlayers === null
+          ? null
+          : Number(minNonClubPlayers);
+    }
+
+    if (useDb && db) {
+      try {
+        await db
+          .update(auctionFranchises)
+          .set({
+            sport: target.sport,
+            slotNumber: target.slotNumber,
+            name: target.name,
+            shortCode: target.shortCode,
+            accentColor: target.accentColor,
+            captainName: target.captainName,
+            startingPurse: target.startingPurse,
+            minSquadSize: target.minSquadSize ?? null,
+            maxSquadSize: target.maxSquadSize ?? null,
+            minClubPlayers: target.minClubPlayers ?? null,
+            minNonClubPlayers: target.minNonClubPlayers ?? null,
+          })
+          .where(eq(auctionFranchises.id, target.id));
+      } catch {
+        // Ignore if table not pushed
+      }
+    }
+
+    broadcastAuctionSnapshot();
+    const summaries = computeFranchiseSummaries();
+    res.json({
+      franchise: summaries.find((f) => f.id === target.id) || target,
+      franchises: summaries,
+    });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+app.delete("/api/auction/franchises/:id", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const actorUserId = Number(req.body?.actorUserId ?? req.query.actorUserId);
+    const actor = await getUserById(actorUserId);
+    if (!actor || !isSportsAdmin(actor.role)) {
+      return res.status(403).json({
+        error: "Only Sports Secretary or Faculty Advisor can delete franchises.",
+      });
+    }
+
+    const idx = auctionState.franchises.findIndex((f) => f.id === id);
+    if (idx === -1) {
+      return res.status(404).json({ error: "Franchise not found." });
+    }
+
+    const hasOwned = auctionState.registrations.some(
+      (r) => r.status === "SOLD" && r.soldToFranchiseId === id
+    );
+    if (hasOwned) {
+      return res.status(400).json({
+        error:
+          "Cannot delete a franchise that already owns SOLD players. Undo those sales first.",
+      });
+    }
+
+    auctionState.franchises.splice(idx, 1);
+
+    if (useDb && db) {
+      try {
+        await db
+          .delete(auctionFranchises)
+          .where(eq(auctionFranchises.id, id));
+      } catch {
+        // Ignore if table not pushed
+      }
+    }
+
+    broadcastAuctionSnapshot();
+    res.json({ deletedId: id, franchises: computeFranchiseSummaries() });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
 app.post("/api/auction/registrations", async (req, res) => {
   try {
-    const { userId, yearLabel, branch, sport, positions, statsSummary } =
-      req.body;
+    const {
+      userId,
+      yearLabel,
+      branch,
+      sport,
+      positions,
+      statsSummary,
+      photoUrl,
+    } = req.body;
 
     if (
       ["FROZEN", "LIVE", "COMPLETED", "PUBLISHED"].includes(
@@ -1083,18 +2224,82 @@ app.post("/api/auction/registrations", async (req, res) => {
         .json({ error: `Already registered for ${sportName}` });
     }
 
+    let savedPhotoUrl: string | null = null;
+    try {
+      savedPhotoUrl = await saveValidatedPlayerPhoto(photoUrl);
+    } catch (photoErr) {
+      return res.status(400).json({
+        error:
+          photoErr instanceof Error
+            ? photoErr.message
+            : "Invalid player photo",
+      });
+    }
+
     const inducted = await getInductedSportsForUser(user.id);
     const isClub = inducted.some(
       (s) => s.toLowerCase() === sportName.toLowerCase()
     );
-    const playerClass = isClub ? "CLUB" : "NON_CLUB";
-    const basePrice = isClub
-      ? auctionState.auction.clubBasePrice
-      : auctionState.auction.nonClubBasePrice;
+    const playerClass: PlayerClass = isClub ? "CLUB" : "NON_CLUB";
+    const basePrice = getEffectiveBasePrice(
+      auctionState.auction,
+      sportName,
+      playerClass
+    );
 
-    const nextId =
+    const configuredPositions =
+      auctionState.auction.positionsBySport?.[sportName] || [];
+    const cleanPositions =
+      Array.isArray(positions) && positions.length
+        ? positions.map(String)
+        : [configuredPositions[0] || "Player"];
+
+    const tiers = auctionState.auction.playerTiers || [
+      "MARQUEE",
+      "TIER_1",
+      "TIER_2",
+      "UNCAPPED",
+    ];
+    const resolvedTier = isClub
+      ? tiers.includes("TIER_1")
+        ? "TIER_1"
+        : tiers[0] || "TIER_1"
+      : tiers[tiers.length - 1] || "UNCAPPED";
+
+    let nextId =
       auctionState.registrations.reduce((max, r) => Math.max(max, r.id), 0) + 1;
-    const registration = {
+
+    if (useDb && db) {
+      try {
+        const [inserted] = await db
+          .insert(auctionRegistrations)
+          .values({
+            auctionId: auctionState.auction.id,
+            userId: user.id,
+            playerName: user.name,
+            rollNumber: user.rollNumber || "IIITT",
+            yearLabel: String(yearLabel || user.batch),
+            branch: String(branch || user.branch),
+            sport: sportName,
+            positionsJson: JSON.stringify(cleanPositions),
+            playerClass,
+            basePrice,
+            tier: resolvedTier,
+            roundId: auctionState.auction.activeRoundId || 1,
+            status: "ELIGIBLE",
+            soldToFranchiseId: null,
+            soldPrice: null,
+            statsSummary: String(statsSummary || "").trim(),
+            photoUrl: savedPhotoUrl,
+          })
+          .returning();
+        if (inserted) nextId = inserted.id;
+      } catch {
+        // Keep in-memory state working even if auction_registrations table hasn't been pushed
+      }
+    }
+
+    const registration: AuctionRegistration = {
       id: nextId,
       auctionId: auctionState.auction.id,
       userId: user.id,
@@ -1103,15 +2308,16 @@ app.post("/api/auction/registrations", async (req, res) => {
       yearLabel: String(yearLabel || user.batch),
       branch: String(branch || user.branch),
       sport: sportName,
-      positions: Array.isArray(positions) && positions.length ? positions : ["Player"],
-      playerClass: playerClass as "CLUB" | "NON_CLUB",
+      positions: cleanPositions,
+      playerClass,
       basePrice,
-      tier: (isClub ? "TIER_1" : "UNCAPPED") as "TIER_1" | "UNCAPPED",
+      tier: resolvedTier,
       roundId: auctionState.auction.activeRoundId || 1,
-      status: "ELIGIBLE" as AuctionPlayerStatus,
+      status: "ELIGIBLE",
       soldToFranchiseId: null,
       soldPrice: null,
       statsSummary: String(statsSummary || "").trim(),
+      photoUrl: savedPhotoUrl,
     };
 
     auctionState.registrations.push(registration);
@@ -1125,23 +2331,126 @@ app.post("/api/auction/registrations", async (req, res) => {
 app.patch("/api/auction/registrations/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const { actorUserId, yearLabel, branch, positions, status } = req.body;
+    const {
+      actorUserId,
+      playerName,
+      rollNumber,
+      yearLabel,
+      branch,
+      positions,
+      playerClass,
+      basePrice,
+      tier,
+      roundId,
+      status,
+      statsSummary,
+      photoUrl,
+    } = req.body;
+
     const actor = await getUserById(Number(actorUserId));
-    if (!actor || !isSportsAdmin(actor.role)) {
-      return res
-        .status(403)
-        .json({ error: "Only Sports Secretary can edit auction entries" });
+    if (!actor || !canOperateAuction(actor.role)) {
+      return res.status(403).json({
+        error:
+          "Only Sports Secretary, Faculty Advisor, or Auction Operator can edit auction entries.",
+      });
+    }
+
+    const admin = isSportsAdmin(actor.role);
+    const adminOnlyFields =
+      playerName !== undefined ||
+      rollNumber !== undefined ||
+      yearLabel !== undefined ||
+      branch !== undefined ||
+      positions !== undefined ||
+      playerClass !== undefined ||
+      tier !== undefined ||
+      statsSummary !== undefined ||
+      photoUrl !== undefined;
+
+    if (!admin && adminOnlyFields) {
+      return res.status(403).json({
+        error:
+          "Auction Operators may adjust base price, round, or status live; full player profile edits require Sports Secretary access.",
+      });
     }
 
     const reg = auctionState.registrations.find((r) => r.id === id);
     if (!reg) return res.status(404).json({ error: "Registration not found" });
 
-    if (yearLabel !== undefined) reg.yearLabel = String(yearLabel);
-    if (branch !== undefined) reg.branch = String(branch);
+    if (playerName !== undefined && String(playerName).trim()) {
+      reg.playerName = String(playerName).trim();
+    }
+    if (rollNumber !== undefined && String(rollNumber).trim()) {
+      reg.rollNumber = String(rollNumber).trim();
+    }
+    if (yearLabel !== undefined) reg.yearLabel = String(yearLabel).trim();
+    if (branch !== undefined) reg.branch = String(branch).trim();
     if (Array.isArray(positions) && positions.length > 0) {
       reg.positions = positions.map(String);
     }
+
+    let classChanged = false;
+    if (playerClass === "CLUB" || playerClass === "NON_CLUB") {
+      if (reg.playerClass !== playerClass) classChanged = true;
+      reg.playerClass = playerClass;
+    }
+
+    if (basePrice !== undefined && basePrice !== "") {
+      const parsedBase = Number(basePrice);
+      if (!Number.isFinite(parsedBase) || parsedBase < 0) {
+        return res
+          .status(400)
+          .json({ error: "Base price must be a non-negative number." });
+      }
+      reg.basePrice = Math.round(parsedBase);
+    } else if (classChanged) {
+      reg.basePrice = getEffectiveBasePrice(
+        auctionState.auction,
+        reg.sport,
+        reg.playerClass
+      );
+    }
+
+    if (tier !== undefined && String(tier).trim()) {
+      reg.tier = String(tier).trim();
+    }
+    if (roundId !== undefined && Number(roundId) > 0) {
+      const targetRound = auctionState.rounds.find(
+        (r) => r.id === Number(roundId)
+      );
+      if (targetRound) reg.roundId = targetRound.id;
+    }
     if (status) reg.status = status as AuctionPlayerStatus;
+    if (statsSummary !== undefined) {
+      reg.statsSummary = String(statsSummary).trim();
+    }
+    if (photoUrl !== undefined) {
+      reg.photoUrl = await saveValidatedPlayerPhoto(photoUrl);
+    }
+
+    if (useDb && db) {
+      try {
+        await db
+          .update(auctionRegistrations)
+          .set({
+            playerName: reg.playerName,
+            rollNumber: reg.rollNumber,
+            yearLabel: reg.yearLabel,
+            branch: reg.branch,
+            positionsJson: JSON.stringify(reg.positions),
+            playerClass: reg.playerClass,
+            basePrice: reg.basePrice,
+            tier: reg.tier,
+            roundId: reg.roundId,
+            status: reg.status,
+            statsSummary: reg.statsSummary,
+            photoUrl: reg.photoUrl ?? null,
+          })
+          .where(eq(auctionRegistrations.id, id));
+      } catch {
+        // Ignore if table not pushed
+      }
+    }
 
     broadcastAuctionSnapshot();
     res.json({ registration: reg });
@@ -1168,6 +2477,19 @@ app.post("/api/auction/round", async (req, res) => {
       else if (r.status === "ACTIVE") r.status = "COMPLETED";
     });
     auctionState.auction.activeRoundId = targetRound.id;
+    if (useDb && db) {
+      try {
+        for (const r of auctionState.rounds) {
+          await db
+            .update(auctionRounds)
+            .set({ status: r.status })
+            .where(eq(auctionRounds.id, r.id));
+        }
+      } catch {
+        // Ignore
+      }
+    }
+    await persistAuctionConfigToDb();
     broadcastAuctionSnapshot();
     res.json({ auction: auctionState.auction });
   } catch (err) {
@@ -1185,6 +2507,7 @@ app.post("/api/auction/status", async (req, res) => {
       });
     }
     auctionState.auction.status = status as AuctionStatus;
+    await persistAuctionConfigToDb();
     broadcastAuctionSnapshot();
     res.json({ auction: auctionState.auction });
   } catch (err) {
@@ -1222,15 +2545,92 @@ app.get("/api/auction/stream", (req, res) => {
 
 app.post("/api/auction/context", async (req, res) => {
   try {
-    const { actorUserId, activeSport, activeRoundId } = req.body;
+    const { actorUserId, activeSport, activeRoundId, currentPlayerId } =
+      req.body;
     const actor = await getUserById(Number(actorUserId));
     if (!actor || !canOperateAuction(actor.role)) {
       return res.status(403).json({ error: "Operator access required" });
     }
-    if (activeSport) auctionState.auction.activeSport = String(activeSport);
-    if (activeRoundId) {
-      auctionState.auction.activeRoundId = Number(activeRoundId);
+
+    if (activeRoundId !== undefined && Number(activeRoundId) > 0) {
+      const targetRound = auctionState.rounds.find(
+        (r) => r.id === Number(activeRoundId)
+      );
+      if (targetRound) {
+        auctionState.rounds.forEach((r) => {
+          if (r.id === targetRound.id) r.status = "ACTIVE";
+          else if (r.status === "ACTIVE") r.status = "COMPLETED";
+        });
+        auctionState.auction.activeRoundId = targetRound.id;
+      }
     }
+
+    if (currentPlayerId !== undefined && currentPlayerId !== null) {
+      const targetPlayer = auctionState.registrations.find(
+        (r) => r.id === Number(currentPlayerId)
+      );
+      if (!targetPlayer) {
+        return res.status(404).json({ error: "Player not found." });
+      }
+      if (targetPlayer.status === "SOLD") {
+        return res.status(400).json({
+          error: `${targetPlayer.playerName} is already SOLD.`,
+        });
+      }
+      const prevPlayer = auctionState.registrations.find(
+        (r) => r.id === auctionState.auction.currentPlayerId
+      );
+      if (
+        prevPlayer &&
+        prevPlayer.id !== targetPlayer.id &&
+        prevPlayer.status === "IN_AUCTION"
+      ) {
+        prevPlayer.status = "ELIGIBLE";
+      }
+      targetPlayer.status = "IN_AUCTION";
+      auctionState.auction.currentPlayerId = targetPlayer.id;
+      auctionState.auction.activeSport = targetPlayer.sport;
+      auctionState.auction.activeRoundId = targetPlayer.roundId;
+      auctionState.auction.projectorMode = "STAGE";
+      await persistAuctionConfigToDb();
+      broadcastAuctionSnapshot();
+      return res.json({
+        message: `Pulled ${targetPlayer.playerName} (${targetPlayer.sport}) onto the auction block.`,
+        snapshot: buildLiveAuctionSnapshot(),
+      });
+    }
+
+    if (activeSport) {
+      const nextSport = String(activeSport);
+      auctionState.auction.activeSport = nextSport;
+      const curPlayer = auctionState.registrations.find(
+        (r) => r.id === auctionState.auction.currentPlayerId
+      );
+      if (
+        !curPlayer ||
+        curPlayer.sport.toLowerCase() !== nextSport.toLowerCase()
+      ) {
+        if (curPlayer && curPlayer.status === "IN_AUCTION") {
+          curPlayer.status = "ELIGIBLE";
+        }
+        const candidate = auctionState.registrations.find(
+          (r) =>
+            r.sport.toLowerCase() === nextSport.toLowerCase() &&
+            (r.status === "ELIGIBLE" ||
+              r.status === "REGISTERED" ||
+              r.status === "RE_AUCTIONED")
+        );
+        if (candidate) {
+          candidate.status = "IN_AUCTION";
+          auctionState.auction.currentPlayerId = candidate.id;
+        } else {
+          auctionState.auction.currentPlayerId = null;
+        }
+        auctionState.auction.projectorMode = "STAGE";
+      }
+    }
+
+    await persistAuctionConfigToDb();
     broadcastAuctionSnapshot();
     res.json({
       message: `Switched auction context to ${auctionState.auction.activeSport}`,
@@ -1249,24 +2649,42 @@ app.post("/api/auction/next-player", async (req, res) => {
       return res.status(403).json({ error: "Operator access required" });
     }
 
+    const prevId = auctionState.auction.currentPlayerId;
+    const prevPlayer = auctionState.registrations.find((r) => r.id === prevId);
+    if (prevPlayer && prevPlayer.status === "IN_AUCTION") {
+      prevPlayer.status = "ELIGIBLE";
+    }
+
     const activeSport = String(sport || auctionState.auction.activeSport);
+    const activeRoundId = auctionState.auction.activeRoundId;
+    const isPoolCandidate = (r: AuctionRegistration) =>
+      r.status === "ELIGIBLE" ||
+      r.status === "REGISTERED" ||
+      r.status === "RE_AUCTIONED";
+
     const nextCandidate =
       auctionState.registrations.find(
         (r) =>
+          r.id !== prevId &&
           r.sport.toLowerCase() === activeSport.toLowerCase() &&
-          (r.status === "ELIGIBLE" ||
-            r.status === "REGISTERED" ||
-            r.status === "RE_AUCTIONED")
+          r.roundId === activeRoundId &&
+          isPoolCandidate(r)
       ) ||
       auctionState.registrations.find(
         (r) =>
-          r.status === "ELIGIBLE" ||
-          r.status === "REGISTERED" ||
-          r.status === "RE_AUCTIONED"
-      );
+          r.id !== prevId &&
+          r.sport.toLowerCase() === activeSport.toLowerCase() &&
+          isPoolCandidate(r)
+      ) ||
+      auctionState.registrations.find(
+        (r) => r.id !== prevId && isPoolCandidate(r)
+      ) ||
+      auctionState.registrations.find((r) => isPoolCandidate(r));
 
     if (!nextCandidate) {
       auctionState.auction.currentPlayerId = null;
+      auctionState.auction.projectorMode = "STAGE";
+      await persistAuctionConfigToDb();
       broadcastAuctionSnapshot();
       return res.json({
         message: "No remaining eligible players in the pool.",
@@ -1278,6 +2696,7 @@ app.post("/api/auction/next-player", async (req, res) => {
     auctionState.auction.currentPlayerId = nextCandidate.id;
     auctionState.auction.activeSport = nextCandidate.sport;
     auctionState.auction.projectorMode = "STAGE";
+    await persistAuctionConfigToDb();
     broadcastAuctionSnapshot();
 
     res.json({
@@ -1308,6 +2727,12 @@ app.post("/api/auction/bid", async (req, res) => {
       return res.status(404).json({ error: "Franchise not found" });
     }
 
+    if (franchise.sport.toLowerCase() !== player.sport.toLowerCase()) {
+      return res.status(400).json({
+        error: `Cross-sport bidding blocked: ${franchise.name} competes in ${franchise.sport}, not ${player.sport}.`,
+      });
+    }
+
     const bidAmount = Number(amount);
     if (!Number.isFinite(bidAmount) || bidAmount < player.basePrice) {
       return res.status(400).json({
@@ -1316,7 +2741,9 @@ app.post("/api/auction/bid", async (req, res) => {
     }
     if (!franchise.isEligibleToBid || bidAmount > franchise.maxAllowedBid) {
       return res.status(400).json({
-        error: `${franchise.name} exceeds max allowed bid (₹${franchise.maxAllowedBid.toLocaleString()})`,
+        error:
+          franchise.lockReason ||
+          `${franchise.name} exceeds max allowed bid (₹${franchise.maxAllowedBid.toLocaleString()})`,
       });
     }
 
@@ -1365,10 +2792,36 @@ app.post("/api/auction/outcome", async (req, res) => {
           .status(400)
           .json({ error: "Valid winning franchise required" });
       }
+      if (franchise.sport.toLowerCase() !== player.sport.toLowerCase()) {
+        return res.status(400).json({
+          error: `Cross-sport sale blocked: ${franchise.name} is a ${franchise.sport} franchise, not ${player.sport}.`,
+        });
+      }
       const soldAmount = Number(amount || player.basePrice);
+      if (!franchise.isEligibleToBid || soldAmount > franchise.maxAllowedBid) {
+        return res.status(400).json({
+          error:
+            franchise.lockReason ||
+            `${franchise.name} cannot complete purchase above max bid ₹${franchise.maxAllowedBid.toLocaleString()}.`,
+        });
+      }
       player.status = "SOLD";
       player.soldToFranchiseId = franchise.id;
       player.soldPrice = soldAmount;
+      if (useDb && db) {
+        try {
+          await db
+            .update(auctionRegistrations)
+            .set({
+              status: "SOLD",
+              soldToFranchiseId: franchise.id,
+              soldPrice: soldAmount,
+            })
+            .where(eq(auctionRegistrations.id, player.id));
+        } catch {
+          // Ignore if table not pushed
+        }
+      }
       auctionState.auction.projectorMode = "SOLD";
       auctionState.bidHistory.push({
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -1382,9 +2835,10 @@ app.post("/api/auction/outcome", async (req, res) => {
         kind: "SOLD",
         timestamp: new Date().toLocaleTimeString(),
       });
+      await persistAuctionConfigToDb();
       broadcastAuctionSnapshot();
       return res.json({
-        message: `SOLD! ${player.playerName} to ${franchise.name} for ₹${soldAmount.toLocaleString()}`,
+        message: `SOLD! ${player.playerName} to ${franchise.name} (${franchise.sport}) for ₹${soldAmount.toLocaleString()}`,
         snapshot: buildLiveAuctionSnapshot(),
       });
     }
@@ -1392,6 +2846,20 @@ app.post("/api/auction/outcome", async (req, res) => {
     player.status = "UNSOLD";
     player.soldToFranchiseId = null;
     player.soldPrice = null;
+    if (useDb && db) {
+      try {
+        await db
+          .update(auctionRegistrations)
+          .set({
+            status: "UNSOLD",
+            soldToFranchiseId: null,
+            soldPrice: null,
+          })
+          .where(eq(auctionRegistrations.id, player.id));
+      } catch {
+        // Ignore if table not pushed
+      }
+    }
     auctionState.auction.projectorMode = "UNSOLD";
     auctionState.bidHistory.push({
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -1405,6 +2873,7 @@ app.post("/api/auction/outcome", async (req, res) => {
       kind: "UNSOLD",
       timestamp: new Date().toLocaleTimeString(),
     });
+    await persistAuctionConfigToDb();
     broadcastAuctionSnapshot();
     res.json({
       message: `${player.playerName} marked UNSOLD.`,
@@ -1437,8 +2906,24 @@ app.post("/api/auction/undo", async (req, res) => {
         player.soldToFranchiseId = null;
         player.soldPrice = null;
         auctionState.auction.currentPlayerId = player.id;
+        auctionState.auction.activeSport = player.sport;
+        if (useDb && db) {
+          try {
+            await db
+              .update(auctionRegistrations)
+              .set({
+                status: "IN_AUCTION",
+                soldToFranchiseId: null,
+                soldPrice: null,
+              })
+              .where(eq(auctionRegistrations.id, player.id));
+          } catch {
+            // Ignore if table not pushed
+          }
+        }
       }
       auctionState.auction.projectorMode = "STAGE";
+      await persistAuctionConfigToDb();
     }
 
     broadcastAuctionSnapshot();
@@ -1503,6 +2988,7 @@ app.post("/api/auction/projector", async (req, res) => {
     if (allowed.includes(mode)) {
       auctionState.auction.projectorMode = mode;
     }
+    await persistAuctionConfigToDb();
     broadcastAuctionSnapshot();
     res.json({
       message: `Projector set to ${auctionState.auction.projectorMode}`,
@@ -1520,16 +3006,17 @@ async function startServer() {
     try {
       await pool.query("SELECT 1");
       console.log("Connected to PostgreSQL via DATABASE_URL.");
-    } catch (err) {
-      console.warn(
-        "PostgreSQL connection failed; falling back to in-memory demo store:",
-        err instanceof Error ? err.message : String(err)
+      await hydrateAuctionFromDb();
+    } catch {
+      console.log(
+        "PostgreSQL host unavailable; running cleanly with in-memory demo store."
       );
       useDb = false;
+      pool.end().catch(() => {});
     }
   } else {
     console.log(
-      "DATABASE_URL not set; running with zero-crash in-memory demo store."
+      "Running with zero-crash in-memory demo store (DATABASE_URL not active)."
     );
   }
 

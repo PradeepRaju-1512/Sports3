@@ -124,16 +124,6 @@ export interface MatchRecord {
   scorerUserId: number | null;
 }
 
-interface RawFranchise {
-  id: number;
-  slotNumber: number;
-  name: string;
-  shortCode: string;
-  accentColor: string;
-  captainName: string;
-  totalPurse: number;
-}
-
 const now = new Date();
 
 export const demoStore = {
@@ -877,46 +867,35 @@ demoStore.notifications.push({
   createdAt: now,
 });
 
-// --- SLICE 3: AUCTION STATE & LIVE SYNC ENGINE ---
+// --- SLICE 3: AUCTION STATE & LIVE SYNC ENGINE (PER-SPORT PURSES & SQUADS) ---
 
-const rawFranchises: RawFranchise[] = [
-  {
-    id: 1,
-    slotNumber: 1,
-    name: "Trichy Titans",
-    shortCode: "TT",
-    accentColor: "#d4a038",
-    captainName: "Karthik Nair",
-    totalPurse: 150000,
-  },
-  {
-    id: 2,
-    slotNumber: 2,
-    name: "Cauvery Kings",
-    shortCode: "CK",
-    accentColor: "#b91c1c",
-    captainName: "Rohan Verma",
-    totalPurse: 150000,
-  },
-  {
-    id: 3,
-    slotNumber: 3,
-    name: "Chola Rovers",
-    shortCode: "CR",
-    accentColor: "#2563eb",
-    captainName: "Siddharth Iyer",
-    totalPurse: 150000,
-  },
-  {
-    id: 4,
-    slotNumber: 4,
-    name: "Pallava Strikers",
-    shortCode: "PS",
-    accentColor: "#16a34a",
-    captainName: "Aditi Menon",
-    totalPurse: 150000,
-  },
-];
+export interface RawFranchise {
+  id: number;
+  auctionId: number;
+  sport: string;
+  slotNumber: number;
+  name: string;
+  shortCode: string;
+  accentColor: string;
+  captainName: string;
+  startingPurse: number;
+  minSquadSize?: number | null;
+  maxSquadSize?: number | null;
+  minClubPlayers?: number | null;
+  minNonClubPlayers?: number | null;
+}
+
+export const DEFAULT_POSITIONS_BY_SPORT: Record<string, string[]> = {
+  Cricket: ["Batsman", "Bowler", "All-Rounder", "Wicketkeeper"],
+  Football: ["Forward / Striker", "Midfielder", "Defender", "Goalkeeper"],
+  Volleyball: ["Setter", "Outside Hitter", "Middle Blocker", "Libero"],
+  Badminton: ["Singles", "Doubles", "Mixed"],
+  Kabaddi: ["Raider", "Defender", "All-Rounder"],
+  "Table Tennis": ["Singles", "Doubles"],
+  "Kho Kho": ["Attacker / Chaser", "Defender / Runner"],
+  Chess: ["Board 1–2", "Board 3–4", "Reserve"],
+  Carrom: ["Singles", "Doubles"],
+};
 
 export const auctionState = {
   auction: {
@@ -928,12 +907,18 @@ export const auctionState = {
     registrationDeadline: "Feb 08, 2027 · 11:59 PM",
     clubBasePrice: 10000,
     nonClubBasePrice: 5000,
+    sportBasePrices: {
+      Football: { clubBasePrice: 8000, nonClubBasePrice: 4000 },
+      Badminton: { clubBasePrice: 6000, nonClubBasePrice: 3000 },
+    },
     defaultIncrement: 1000,
     jumpIncrement: 5000,
     minSquadSize: 8,
     maxSquadSize: 15,
     minClubPlayers: 3,
     minNonClubPlayers: 2,
+    playerTiers: ["MARQUEE", "TIER_1", "TIER_2", "UNCAPPED"],
+    positionsBySport: { ...DEFAULT_POSITIONS_BY_SPORT },
     activeRoundId: 1,
     activeSport: "Cricket",
     currentPlayerId: 1,
@@ -953,17 +938,179 @@ export const auctionState = {
       id: 2,
       auctionId: 1,
       roundNumber: 2,
-      name: "Round 2 · Accelerated",
+      name: "Round 2 · Accelerated / Unsold",
       status: "PENDING",
     },
     {
       id: 3,
       auctionId: 1,
       roundNumber: 3,
-      name: "Round 3 · RTM / Unsold",
+      name: "Round 3 · RTM / Final",
       status: "PENDING",
     },
   ] as AuctionRound[],
+
+  franchises: [
+    // Cricket Franchises (dedicated Cricket purses & squads; captains distinct from Cricket pool)
+    {
+      id: 1,
+      auctionId: 1,
+      sport: "Cricket",
+      slotNumber: 1,
+      name: "Trichy Titans",
+      shortCode: "TT",
+      accentColor: "#d4a038",
+      captainName: "Karthik Nair",
+      startingPurse: 150000,
+    },
+    {
+      id: 2,
+      auctionId: 1,
+      sport: "Cricket",
+      slotNumber: 2,
+      name: "Cauvery Kings",
+      shortCode: "CK",
+      accentColor: "#b91c1c",
+      captainName: "Vikram Rao",
+      startingPurse: 150000,
+    },
+    {
+      id: 3,
+      auctionId: 1,
+      sport: "Cricket",
+      slotNumber: 3,
+      name: "Chola Rovers",
+      shortCode: "CR",
+      accentColor: "#2563eb",
+      captainName: "Arjun Das",
+      startingPurse: 150000,
+    },
+    {
+      id: 4,
+      auctionId: 1,
+      sport: "Cricket",
+      slotNumber: 4,
+      name: "Pallava Strikers",
+      shortCode: "PS",
+      accentColor: "#16a34a",
+      captainName: "Siddharth Iyer",
+      startingPurse: 150000,
+    },
+    // Football Franchises (separate Football purses & squads)
+    {
+      id: 5,
+      auctionId: 1,
+      sport: "Football",
+      slotNumber: 1,
+      name: "Kaveri United",
+      shortCode: "KU",
+      accentColor: "#d4a038",
+      captainName: "Karthik Nair",
+      startingPurse: 120000,
+    },
+    {
+      id: 6,
+      auctionId: 1,
+      sport: "Football",
+      slotNumber: 2,
+      name: "Chola Rovers FC",
+      shortCode: "CR",
+      accentColor: "#b91c1c",
+      captainName: "Vikram Rao",
+      startingPurse: 120000,
+    },
+    {
+      id: 7,
+      auctionId: 1,
+      sport: "Football",
+      slotNumber: 3,
+      name: "Rockfort XI",
+      shortCode: "RX",
+      accentColor: "#2563eb",
+      captainName: "Aditi Menon",
+      startingPurse: 120000,
+    },
+    {
+      id: 8,
+      auctionId: 1,
+      sport: "Football",
+      slotNumber: 4,
+      name: "Delta Dynamos FC",
+      shortCode: "DD",
+      accentColor: "#16a34a",
+      captainName: "Rohan Verma",
+      startingPurse: 120000,
+    },
+    // Volleyball Franchises
+    {
+      id: 9,
+      auctionId: 1,
+      sport: "Volleyball",
+      slotNumber: 1,
+      name: "Trichy Spikers",
+      shortCode: "TS",
+      accentColor: "#d4a038",
+      captainName: "Vikram Rao",
+      startingPurse: 100000,
+    },
+    {
+      id: 10,
+      auctionId: 1,
+      sport: "Volleyball",
+      slotNumber: 2,
+      name: "Cauvery Blockers",
+      shortCode: "CB",
+      accentColor: "#b91c1c",
+      captainName: "Arjun Das",
+      startingPurse: 100000,
+    },
+    // Badminton Franchises
+    {
+      id: 11,
+      auctionId: 1,
+      sport: "Badminton",
+      slotNumber: 1,
+      name: "Shuttlers United",
+      shortCode: "SU",
+      accentColor: "#d4a038",
+      captainName: "Aditi Menon",
+      startingPurse: 80000,
+    },
+    {
+      id: 12,
+      auctionId: 1,
+      sport: "Badminton",
+      slotNumber: 2,
+      name: "Smash Royals",
+      shortCode: "SR",
+      accentColor: "#2563eb",
+      captainName: "Karthik Nair",
+      startingPurse: 80000,
+    },
+    // Kabaddi Franchises
+    {
+      id: 13,
+      auctionId: 1,
+      sport: "Kabaddi",
+      slotNumber: 1,
+      name: "Chola Raiders",
+      shortCode: "CR",
+      accentColor: "#b91c1c",
+      captainName: "Arjun Das",
+      startingPurse: 100000,
+    },
+    {
+      id: 14,
+      auctionId: 1,
+      sport: "Kabaddi",
+      slotNumber: 2,
+      name: "Trichy Defenders",
+      shortCode: "TD",
+      accentColor: "#16a34a",
+      captainName: "Vikram Rao",
+      startingPurse: 100000,
+    },
+  ] as RawFranchise[],
 
   registrations: [
     {
@@ -984,6 +1131,7 @@ export const auctionState = {
       soldToFranchiseId: null,
       soldPrice: null,
       statsSummary: "2026 Top Scorer · 185 runs & 9 wickets in 4 matches",
+      photoUrl: "/uploads/players/rohan-verma.jpg",
     },
     {
       id: 2,
@@ -1003,6 +1151,7 @@ export const auctionState = {
       soldToFranchiseId: null,
       soldPrice: null,
       statsSummary: "Prothymos 2025 Opening Match POTM (71 runs)",
+      photoUrl: "/uploads/players/aditi-menon.jpg",
     },
     {
       id: 3,
@@ -1015,13 +1164,14 @@ export const auctionState = {
       sport: "Football",
       positions: ["Forward / Striker", "Midfielder"],
       playerClass: "CLUB",
-      basePrice: 10000,
+      basePrice: 8000,
       tier: "MARQUEE",
       roundId: 1,
       status: "ELIGIBLE",
       soldToFranchiseId: null,
       soldPrice: null,
       statsSummary: "2024 Golden Boot · 7 goals in Autumn Sports Meet",
+      photoUrl: "/uploads/players/siddharth-iyer.jpg",
     },
     {
       id: 4,
@@ -1034,13 +1184,14 @@ export const auctionState = {
       sport: "Badminton",
       positions: ["Singles", "Doubles"],
       playerClass: "CLUB",
-      basePrice: 10000,
+      basePrice: 6000,
       tier: "TIER_1",
       roundId: 1,
       status: "ELIGIBLE",
       soldToFranchiseId: null,
       soldPrice: null,
       statsSummary: "Inter-batch Indoor Singles Finalist",
+      photoUrl: "/uploads/players/meera-krishnan.jpg",
     },
     {
       id: 5,
@@ -1060,52 +1211,188 @@ export const auctionState = {
       soldToFranchiseId: null,
       soldPrice: null,
       statsSummary: "Inter-hostel standout opener",
+      photoUrl: "/uploads/players/ananya-reddy.jpg",
+    },
+    {
+      id: 6,
+      auctionId: 1,
+      userId: 7,
+      playerName: "Meera Krishnan",
+      rollNumber: "ME25B1018",
+      yearLabel: "1st Year",
+      branch: "MECH",
+      sport: "Cricket",
+      positions: ["Bowler", "All-Rounder"],
+      playerClass: "CLUB",
+      basePrice: 10000,
+      tier: "TIER_1",
+      roundId: 1,
+      status: "SOLD",
+      soldToFranchiseId: 1, // Trichy Titans (Cricket)
+      soldPrice: 22000,
+      statsSummary: "2026 Inter-Batch Emerging All-Rounder",
+      photoUrl: "/uploads/players/meera-krishnan.jpg",
+    },
+    {
+      id: 7,
+      auctionId: 1,
+      userId: 5,
+      playerName: "Arjun Das",
+      rollNumber: "CS23B1019",
+      yearLabel: "3rd Year",
+      branch: "CSE",
+      sport: "Football",
+      positions: ["Midfielder", "Defender"],
+      playerClass: "CLUB",
+      basePrice: 8000,
+      tier: "TIER_1",
+      roundId: 1,
+      status: "SOLD",
+      soldToFranchiseId: 5, // Kaveri United (Football — separate purse from Cricket!)
+      soldPrice: 16000,
+      statsSummary: "2026 Inter-Batch Defensive Midfielder of the Meet",
+      photoUrl: "/uploads/players/siddharth-iyer.jpg",
     },
   ] as AuctionRegistration[],
 
   bidHistory: [] as BidEvent[],
 };
 
+export function getEffectiveBasePrice(
+  cfg: AuctionConfig,
+  sport: string,
+  playerClass: "CLUB" | "NON_CLUB"
+): number {
+  const override = cfg.sportBasePrices?.[sport];
+  if (override) {
+    return playerClass === "CLUB"
+      ? Number(override.clubBasePrice)
+      : Number(override.nonClubBasePrice);
+  }
+  return playerClass === "CLUB"
+    ? Number(cfg.clubBasePrice)
+    : Number(cfg.nonClubBasePrice);
+}
+
 export function computeFranchiseSummaries(): FranchiseSummary[] {
   const cfg = auctionState.auction;
-  const minPrice = Math.min(cfg.clubBasePrice, cfg.nonClubBasePrice);
+  const activePlayer =
+    auctionState.registrations.find((r) => r.id === cfg.currentPlayerId) ||
+    null;
 
-  return rawFranchises.map((f) => {
+  return auctionState.franchises.map((f) => {
     const owned = auctionState.registrations.filter(
-      (r) => r.status === "SOLD" && r.soldToFranchiseId === f.id
+      (r) =>
+        r.status === "SOLD" &&
+        r.soldToFranchiseId === f.id &&
+        r.sport.toLowerCase() === f.sport.toLowerCase()
     );
-    const spent = owned.reduce((acc, r) => acc + (r.soldPrice || 0), 0);
-    const remainingPurse = Math.max(0, f.totalPurse - spent);
+
+    const spentPurse = owned.reduce((acc, r) => acc + (r.soldPrice || 0), 0);
+    const remainingPurse = Math.max(0, f.startingPurse - spentPurse);
     const squadCount = owned.length;
     const clubCount = owned.filter((r) => r.playerClass === "CLUB").length;
     const nonClubCount = owned.filter(
       (r) => r.playerClass === "NON_CLUB"
     ).length;
 
-    const remainingMinSlots = Math.max(0, cfg.minSquadSize - squadCount - 1);
-    const reserveNeeded = remainingMinSlots * minPrice;
+    const minSquad = f.minSquadSize ?? cfg.minSquadSize;
+    const maxSquad = f.maxSquadSize ?? cfg.maxSquadSize;
+    const minClub = f.minClubPlayers ?? cfg.minClubPlayers;
+    const minNonClub = f.minNonClubPlayers ?? cfg.minNonClubPlayers;
+
+    const clubPrice = getEffectiveBasePrice(cfg, f.sport, "CLUB");
+    const nonClubPrice = getEffectiveBasePrice(cfg, f.sport, "NON_CLUB");
+    const minPrice = Math.min(clubPrice, nonClubPrice);
+
+    const isSameSportPlayer =
+      activePlayer &&
+      activePlayer.sport.toLowerCase() === f.sport.toLowerCase();
+
+    const remClubAfterBuy = isSameSportPlayer
+      ? Math.max(
+          0,
+          minClub - clubCount - (activePlayer.playerClass === "CLUB" ? 1 : 0)
+        )
+      : Math.max(0, minClub - clubCount);
+
+    const remNonClubAfterBuy = isSameSportPlayer
+      ? Math.max(
+          0,
+          minNonClub -
+            nonClubCount -
+            (activePlayer.playerClass === "NON_CLUB" ? 1 : 0)
+        )
+      : Math.max(0, minNonClub - nonClubCount);
+
+    const remainingMinSlots = Math.max(0, minSquad - squadCount - 1);
+    const remainingMaxSlotsAfterBuy = Math.max(0, maxSquad - squadCount - 1);
+    const extraMinSlots = Math.max(
+      0,
+      remainingMinSlots - remClubAfterBuy - remNonClubAfterBuy
+    );
+    const reserveNeeded =
+      remClubAfterBuy * clubPrice +
+      remNonClubAfterBuy * nonClubPrice +
+      extraMinSlots * minPrice;
+
     const maxAllowedBid = Math.max(0, remainingPurse - reserveNeeded);
 
     let isEligibleToBid = true;
     let lockReason: string | undefined;
 
-    if (squadCount >= cfg.maxSquadSize) {
+    if (squadCount >= maxSquad) {
       isEligibleToBid = false;
       lockReason = "Max squad size reached";
-    } else if (maxAllowedBid < minPrice) {
+    } else if (
+      isSameSportPlayer &&
+      remClubAfterBuy + remNonClubAfterBuy > remainingMaxSlotsAfterBuy
+    ) {
+      isEligibleToBid = false;
+      lockReason = `Quota lock: reserve slots for ${remClubAfterBuy > 0 ? "CLUB" : "NON_CLUB"}`;
+    } else if (
+      isSameSportPlayer &&
+      maxAllowedBid < activePlayer.basePrice
+    ) {
+      isEligibleToBid = false;
+      lockReason = "Purse reserve guardrail";
+    } else if (!isSameSportPlayer && maxAllowedBid < minPrice) {
       isEligibleToBid = false;
       lockReason = "Purse reserve guardrail";
     }
 
     return {
-      ...f,
+      id: f.id,
+      auctionId: f.auctionId,
+      sport: f.sport,
+      slotNumber: f.slotNumber,
+      name: f.name,
+      shortCode: f.shortCode,
+      accentColor: f.accentColor,
+      captainName: f.captainName,
+      startingPurse: f.startingPurse,
+      totalPurse: f.startingPurse,
+      spentPurse,
       remainingPurse,
+      minSquadSize: minSquad,
+      maxSquadSize: maxSquad,
+      minClubPlayers: minClub,
+      minNonClubPlayers: minNonClub,
       squadCount,
       clubCount,
       nonClubCount,
       maxAllowedBid,
       isEligibleToBid,
       lockReason,
+      purchasedPlayers: owned.map((p) => ({
+        id: p.id,
+        playerName: p.playerName,
+        sport: p.sport,
+        positions: p.positions,
+        soldPrice: p.soldPrice || p.basePrice,
+        playerClass: p.playerClass,
+        photoUrl: p.photoUrl || null,
+      })),
     };
   });
 }
@@ -1113,7 +1400,9 @@ export function computeFranchiseSummaries(): FranchiseSummary[] {
 export function buildLiveAuctionSnapshot(): LiveAuctionSnapshot {
   return {
     auction: auctionState.auction,
-    rounds: auctionState.rounds,
+    rounds: [...auctionState.rounds].sort(
+      (a, b) => a.roundNumber - b.roundNumber || a.id - b.id
+    ),
     registrations: auctionState.registrations,
     franchises: computeFranchiseSummaries(),
     bidHistory: auctionState.bidHistory,

@@ -17,11 +17,16 @@ export type AuctionPlayerStatus =
   | "RE_AUCTIONED"
   | "INELIGIBLE";
 
+export interface SportBasePriceOverride {
+  clubBasePrice: number;
+  nonClubBasePrice: number;
+}
+
 export interface AuctionRound {
   id: number;
   auctionId: number;
   roundNumber: number;
-  name: string; // e.g. "Round 1 · Main Pool", "Round 2 · Accelerated", "Round 3 · RTM / Final"
+  name: string;
   status: "PENDING" | "ACTIVE" | "COMPLETED";
 }
 
@@ -29,17 +34,20 @@ export interface AuctionConfig {
   id: number;
   name: string;
   seasonYear: number;
-  sports: string[]; // e.g. ["Cricket", "Football", "Volleyball", "Throwball", "Badminton"]
+  sports: string[];
   status: AuctionStatus;
   registrationDeadline: string;
   clubBasePrice: number;
   nonClubBasePrice: number;
+  sportBasePrices: Record<string, SportBasePriceOverride>;
   defaultIncrement: number;
   jumpIncrement: number;
   minSquadSize: number;
   maxSquadSize: number;
   minClubPlayers: number;
   minNonClubPlayers: number;
+  playerTiers: string[];
+  positionsBySport: Record<string, string[]>;
   activeRoundId: number | null;
   activeSport: string;
   currentPlayerId: number | null;
@@ -53,35 +61,55 @@ export interface AuctionRegistration {
   userId: number;
   playerName: string;
   rollNumber: string;
-  yearLabel: string; // "1st Year" | "2nd Year" | "3rd Year" | "4th Year" | "MTech"
-  branch: string; // "CSE" | "ECE" | "MECH" | etc.
-  sport: string; // Single sport per registration row
-  positions: string[]; // Multiple positions allowed for this sport
-  playerClass: PlayerClass; // Derived from inducted club membership for this sport
+  yearLabel: string;
+  branch: string;
+  sport: string;
+  positions: string[];
+  playerClass: PlayerClass;
   basePrice: number;
-  tier: "MARQUEE" | "TIER_1" | "TIER_2" | "UNCAPPED";
+  tier: string;
   roundId: number;
   status: AuctionPlayerStatus;
   soldToFranchiseId: number | null;
   soldPrice: number | null;
   statsSummary: string;
+  photoUrl?: string | null;
+}
+
+export interface PurchasedPlayer {
+  id: number;
+  playerName: string;
+  sport: string;
+  positions: string[];
+  soldPrice: number;
+  playerClass: PlayerClass;
+  photoUrl?: string | null;
 }
 
 export interface FranchiseSummary {
   id: number;
-  slotNumber: number; // 1..8 for keyboard hotkeys 1-8
+  auctionId: number;
+  sport: string;
+  slotNumber: number; // 1..8 within sport for keyboard hotkeys
   name: string;
   shortCode: string;
   accentColor: string;
   captainName: string;
+  startingPurse: number;
   totalPurse: number;
+  spentPurse: number;
   remainingPurse: number;
+  minSquadSize: number;
+  maxSquadSize: number;
+  minClubPlayers: number;
+  minNonClubPlayers: number;
   squadCount: number;
   clubCount: number;
   nonClubCount: number;
   maxAllowedBid: number;
   isEligibleToBid: boolean;
   lockReason?: string;
+  purchasedPlayers: PurchasedPlayer[];
 }
 
 export interface BidEvent {

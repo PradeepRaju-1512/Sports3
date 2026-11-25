@@ -141,3 +141,80 @@ export const tournamentMatches = pgTable("tournament_matches", {
   detailedBreakdown: text("detailed_breakdown").notNull().default(""),
   scorerUserId: integer("scorer_user_id").references(() => users.id),
 });
+
+// --- SLICE 3: AUCTIONS, ROUNDS, PER-SPORT FRANCHISES & REGISTRATIONS ---
+
+export const auctions = pgTable("auctions", {
+  id: serial("id").primaryKey(),
+  name: text("name").notNull(),
+  seasonYear: integer("season_year").notNull().default(2027),
+  sportsJson: text("sports_json").notNull().default("[]"),
+  status: text("status").notNull().default("REGISTRATION_OPEN"),
+  registrationDeadline: text("registration_deadline").notNull().default(""),
+  clubBasePrice: integer("club_base_price").notNull().default(10000),
+  nonClubBasePrice: integer("non_club_base_price").notNull().default(5000),
+  sportBasePricesJson: text("sport_base_prices_json").notNull().default("{}"),
+  defaultIncrement: integer("default_increment").notNull().default(1000),
+  jumpIncrement: integer("jump_increment").notNull().default(5000),
+  minSquadSize: integer("min_squad_size").notNull().default(8),
+  maxSquadSize: integer("max_squad_size").notNull().default(15),
+  minClubPlayers: integer("min_club_players").notNull().default(3),
+  minNonClubPlayers: integer("min_non_club_players").notNull().default(2),
+  playerTiersJson: text("player_tiers_json")
+    .notNull()
+    .default('["MARQUEE","TIER_1","TIER_2","UNCAPPED"]'),
+  positionsBySportJson: text("positions_by_sport_json").notNull().default("{}"),
+  activeRoundId: integer("active_round_id"),
+  activeSport: text("active_sport").notNull().default("Cricket"),
+  currentPlayerId: integer("current_player_id"),
+  projectorMode: text("projector_mode").notNull().default("STAGE"),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+
+export const auctionRounds = pgTable("auction_rounds", {
+  id: serial("id").primaryKey(),
+  auctionId: integer("auction_id").notNull().default(1),
+  roundNumber: integer("round_number").notNull().default(1),
+  name: text("name").notNull(),
+  status: text("status").notNull().default("PENDING"), // PENDING | ACTIVE | COMPLETED
+});
+
+export const auctionFranchises = pgTable("auction_franchises", {
+  id: serial("id").primaryKey(),
+  auctionId: integer("auction_id").notNull().default(1),
+  sport: text("sport").notNull(),
+  slotNumber: integer("slot_number").notNull().default(1),
+  name: text("name").notNull(),
+  shortCode: text("short_code").notNull(),
+  accentColor: text("accent_color").notNull().default("#d4a038"),
+  captainName: text("captain_name").notNull().default(""),
+  startingPurse: integer("starting_purse").notNull().default(150000),
+  minSquadSize: integer("min_squad_size"),
+  maxSquadSize: integer("max_squad_size"),
+  minClubPlayers: integer("min_club_players"),
+  minNonClubPlayers: integer("min_non_club_players"),
+});
+
+export const auctionRegistrations = pgTable("auction_registrations", {
+  id: serial("id").primaryKey(),
+  auctionId: integer("auction_id").notNull().default(1),
+  userId: integer("user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  playerName: text("player_name").notNull(),
+  rollNumber: text("roll_number").notNull().default("IIITT"),
+  yearLabel: text("year_label").notNull(),
+  branch: text("branch").notNull(),
+  sport: text("sport").notNull(),
+  positionsJson: text("positions_json").notNull().default("[]"),
+  playerClass: text("player_class").notNull().default("NON_CLUB"), // CLUB | NON_CLUB
+  basePrice: integer("base_price").notNull().default(5000),
+  tier: text("tier").notNull().default("UNCAPPED"),
+  roundId: integer("round_id").notNull().default(1),
+  status: text("status").notNull().default("ELIGIBLE"), // REGISTERED | ELIGIBLE | IN_AUCTION | SOLD | UNSOLD | RE_AUCTIONED | INELIGIBLE
+  soldToFranchiseId: integer("sold_to_franchise_id"),
+  soldPrice: integer("sold_price"),
+  statsSummary: text("stats_summary").notNull().default(""),
+  photoUrl: text("photo_url"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
